@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <limits.h>
 #include <pthread.h>
+#include <sys/time.h>
 #include <sys/ioctl.h>
 
 #define STDIN 0
@@ -302,9 +303,9 @@ void snake_crawl(struct Snake *snake, struct GridCell *food, unsigned int width,
 void* game_loop(void *thread_info) {
   pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
   
-  struct timespec sleep_time;
-  sleep_time.tv_sec = DELAY_TIME_MS / 1000;
-  sleep_time.tv_nsec = (DELAY_TIME_MS % 1000) * 1000000;
+  struct timespec target_sleep_time;
+  target_sleep_time.tv_sec = DELAY_TIME_MS / 1000;
+  target_sleep_time.tv_nsec = (DELAY_TIME_MS % 1000) * 1000000;
   
   struct ThreadInfo *th_info = (struct ThreadInfo*)thread_info;
   struct Snake *snake = th_info->snake;
@@ -313,6 +314,9 @@ void* game_loop(void *thread_info) {
   
   // Game Loop
   while (1) {
+    struct timeval loop_start_time;
+    gettimeofday(&loop_start_time, NULL);
+    
     sem_wait(&sem0);
     snake_crawl(snake, food, grid_width, grid_height);
     regen_buffer(display_content, snake, food, grid_width, grid_height);
@@ -320,7 +324,27 @@ void* game_loop(void *thread_info) {
     sem_post(&sem0);
     
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
-    nanosleep(&sleep_time, NULL);
+    
+    struct timeval loop_end_time;
+    gettimeofday(&loop_end_time, NULL);
+    
+    loop_end_time.tv_sec  -= loop_start_time.tv_sec;
+    loop_end_time.tv_usec -= loop_start_time.tv_usec;
+    
+    struct timespec actual_sleep_time;
+    actual_sleep_time.tv_sec = 0;
+    actual_sleep_time.tv_nsec = 0;
+    
+    if        ( loop_end_time.tv_sec <  target_sleep_time.tv_sec) {
+    } else if ( loop_end_time.tv_sec == target_sleep_time.tv_sec) {
+      if      ((loop_end_time.tv_usec * 1000) < target_sleep_time.tv_nsec) {
+        actual_sleep_time.tv_sec  = target_sleep_time.tv_sec  - loop_end_time.tv_sec;
+        actual_sleep_time.tv_nsec = target_sleep_time.tv_nsec - (loop_end_time.tv_usec * 1000);
+      }
+    }
+    
+    nanosleep(&actual_sleep_time, NULL);
+    
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
   }
   return NULL;
@@ -330,74 +354,88 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
   unsigned int exit_code = 0;
   
   // Seed the PRNG
-  time_t s = time(NULL);
-  if (s == (time_t)-1) {
-    exit(2);
+  {
+    time_t s = time(NULL);
+    if (s == (time_t)-1) {
+      exit(2);
+    }
+    srand((unsigned int)(s % INT_MAX));
   }
-  srand((unsigned int)(s % INT_MAX));
   
-  // Setup the Signal Handler for Terminal Resize Events 
-  struct sigaction sig_action;
-  sig_action.sa_handler = &signal_handle;
-  sigemptyset(&(sig_action.sa_mask));
-  sig_action.sa_flags = 0;
-  signed int retval = sigaction(SIGWINCH, &sig_action, NULL);
-  if (retval == -1) {
-    //dprintf(STDOUT, "Error - sigaction failed with errno %d: %s\n", errno, strerror(errno));
-    exit(1);
+  // Setup the Signal Handler for Terminal Resize Events
+  {
+    struct sigaction sig_action;
+    sig_action.sa_handler = &signal_handle;
+    sigemptyset(&(sig_action.sa_mask));
+    sig_action.sa_flags = 0;
+    signed int retval = sigaction(SIGWINCH, &sig_action, NULL);
+    if (retval == -1) {
+      //dprintf(STDOUT, "Error - sigaction failed with errno %d: %s\n", errno, strerror(errno));
+      exit(1);
+    }
   }
   
   // Mask Signal Handlers
   // Reason 1: Prevent a race condition with the manual terminal size check
   // Reason 2: Cause the new thread to inherit masked signals so that they are only handled in this thread
   sigset_t old_signal_mask;
-  sigset_t add_signal_mask;
-  if (sigemptyset(&old_signal_mask) == -1) {
-    exit(5);
-  }
-  if (sigemptyset(&add_signal_mask) == -1) {
-    exit(6);
-  }
-  if (sigaddset(&add_signal_mask, SIGWINCH) == -1) {
-    exit(7);
-  }
-  if (sigprocmask(SIG_BLOCK, &add_signal_mask, &old_signal_mask) == -1) {
-    exit(8);
+  {
+    sigset_t add_signal_mask;
+    if (sigemptyset(&old_signal_mask) == -1) {
+      exit(5);
+    }
+    if (sigemptyset(&add_signal_mask) == -1) {
+      exit(6);
+    }
+    if (sigaddset(&add_signal_mask, SIGWINCH) == -1) {
+      exit(7);
+    }
+    if (sigprocmask(SIG_BLOCK, &add_signal_mask, &old_signal_mask) == -1) {
+      exit(8);
+    }
   }
   
   // Determine the terminal size
-  signal_handle(SIGWINCH); // Pretend that a SIGWINCH was received
-  grid_width = term_width;
-  grid_height = term_height;
+  {
+    signal_handle(SIGWINCH); // Pretend that a SIGWINCH was received
+    grid_width = term_width;
+    grid_height = term_height;
+  }
   
   // Allocated the memory for the Grid
   char* display_content = 0;
-  unsigned int buffer_size = (grid_width + 1) * grid_height * sizeof(char) * 4;
-  display_content = malloc(buffer_size);
+  {
+    unsigned int buffer_size = (grid_width + 1) * grid_height * sizeof(char) * 4;
+    display_content = malloc(buffer_size);
+    // TODO: Handle malloc failure
+  }
   
   // Init the Snake
   struct Snake snake;
-  snake.new_direction = STARTING_DIRECTION;
-  snake.direction = STARTING_DIRECTION;
-  snake.length = STARTING_LENGTH;
-  snake.grid_used_length = STARTING_LENGTH;
-  snake.grow_by = STARTING_GROW_BY;
-  snake.cells = malloc(sizeof(struct GridCell) * STARTING_LENGTH);
-  snake.cells[0].x = grid_width / 2;
-  snake.cells[0].y = grid_height / 2;
-  for (unsigned int i = 1; i < STARTING_LENGTH; i++) {
-    if (STARTING_DIRECTION == DIR_UP) {
-      snake.cells[i].x = snake.cells[0].x;
-      snake.cells[i].y = snake.cells[0].y + i;
-    } else if (STARTING_DIRECTION == DIR_DOWN) {
-      snake.cells[i].x = snake.cells[0].x;
-      snake.cells[i].y = snake.cells[0].y - i;
-    } else if (STARTING_DIRECTION == DIR_LEFT) {
-      snake.cells[i].x = snake.cells[0].x + i;
-      snake.cells[i].y = snake.cells[0].y;
-    } else {
-      snake.cells[i].x = snake.cells[0].x - i;
-      snake.cells[i].y = snake.cells[0].y;
+  {
+    snake.new_direction = STARTING_DIRECTION;
+    snake.direction = STARTING_DIRECTION;
+    snake.length = STARTING_LENGTH;
+    snake.grid_used_length = STARTING_LENGTH;
+    snake.grow_by = STARTING_GROW_BY;
+    snake.cells = malloc(sizeof(struct GridCell) * STARTING_LENGTH);
+    // TODO: Handle malloc failure
+    snake.cells[0].x = grid_width / 2;
+    snake.cells[0].y = grid_height / 2;
+    for (unsigned int i = 1; i < STARTING_LENGTH; i++) {
+      if (STARTING_DIRECTION == DIR_UP) {
+        snake.cells[i].x = snake.cells[0].x;
+        snake.cells[i].y = snake.cells[0].y + i;
+      } else if (STARTING_DIRECTION == DIR_DOWN) {
+        snake.cells[i].x = snake.cells[0].x;
+        snake.cells[i].y = snake.cells[0].y - i;
+      } else if (STARTING_DIRECTION == DIR_LEFT) {
+        snake.cells[i].x = snake.cells[0].x + i;
+        snake.cells[i].y = snake.cells[0].y;
+      } else {
+        snake.cells[i].x = snake.cells[0].x - i;
+        snake.cells[i].y = snake.cells[0].y;
+      }
     }
   }
   
