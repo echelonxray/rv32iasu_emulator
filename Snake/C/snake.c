@@ -31,9 +31,9 @@
 // How many cells should be added to the snake when food is consumed?
 // If GROW_BY_INCREMENT is not 0, this will change after the first unit 
 // of food is consumed.
-#define STARTING_GROW_BY 50
+#define STARTING_GROW_BY 2
 // What should be added to the "Grow By" rate after food is consumed?
-#define GROW_BY_INCREMENT 0
+#define GROW_BY_INCREMENT 2
 // How long should the delay between ticks be in milliseconds?
 #define DELAY_TIME_MS 150
 
@@ -314,37 +314,63 @@ void* game_loop(void *thread_info) {
   
   // Game Loop
   while (1) {
+    // Get processing start time
     struct timeval loop_start_time;
     gettimeofday(&loop_start_time, NULL);
     
+    // The meat of the game loop:
+    // --Get a lock on the thread synchronization tool (Mutex or Binary Semaphore)
+    // --Crawl the snake forward
+    // --Use the newly generated data to renderer the display buffer
+    // --Print/Draw the display buffer
+    // --Release the lock
     sem_wait(&sem0);
     snake_crawl(snake, food, grid_width, grid_height);
     regen_buffer(display_content, snake, food, grid_width, grid_height);
     dprintf(STDOUT, "\x1b[%d;%dH%s", 1, 1, display_content);
     sem_post(&sem0);
     
-    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    // The rest of the loop below calculates sleep time and sleeps while 
+    // thread cancellation is enabled, providing a clean exit point.
     
+    // Get processing end time
     struct timeval loop_end_time;
     gettimeofday(&loop_end_time, NULL);
     
-    loop_end_time.tv_sec  -= loop_start_time.tv_sec;
-    loop_end_time.tv_usec -= loop_start_time.tv_usec;
+    // How much time elapsed while processing?
+    if (loop_end_time.tv_usec < loop_start_time.tv_usec) {
+      loop_end_time.tv_sec--;
+      loop_end_time.tv_usec += (1000000 - loop_start_time.tv_usec);
+    } else {
+      loop_end_time.tv_usec -= loop_start_time.tv_usec;
+    }
+    loop_end_time.tv_sec -= loop_start_time.tv_sec;
     
+    // Init nanosleep struct with time 0 in case processing took too long.
+    // nanosleep() much still be called to give the thread an opportunity to be cancelled.
     struct timespec actual_sleep_time;
     actual_sleep_time.tv_sec = 0;
     actual_sleep_time.tv_nsec = 0;
     
-    if        ( loop_end_time.tv_sec <  target_sleep_time.tv_sec) {
-    } else if ( loop_end_time.tv_sec == target_sleep_time.tv_sec) {
-      if      ((loop_end_time.tv_usec * 1000) < target_sleep_time.tv_nsec) {
-        actual_sleep_time.tv_sec  = target_sleep_time.tv_sec  - loop_end_time.tv_sec;
-        actual_sleep_time.tv_nsec = target_sleep_time.tv_nsec - (loop_end_time.tv_usec * 1000);
+    // Is the elapsed processing time less than the target sleep time?
+    if (((loop_end_time.tv_sec == target_sleep_time.tv_sec) && (((long)loop_end_time.tv_usec * 1000) < target_sleep_time.tv_nsec)) || \
+         (loop_end_time.tv_sec <  target_sleep_time.tv_sec)) {
+      
+      // Set the nanosleep time to the target time remaining
+      actual_sleep_time.tv_sec = target_sleep_time.tv_sec - loop_end_time.tv_sec;
+      if ((long)loop_end_time.tv_usec * 1000 > target_sleep_time.tv_nsec) {
+        actual_sleep_time.tv_sec--;
+        actual_sleep_time.tv_nsec = (1000000l - loop_end_time.tv_usec) * 1000 + target_sleep_time.tv_nsec;
+      } else {
+        actual_sleep_time.tv_nsec = target_sleep_time.tv_nsec - ((long)loop_end_time.tv_usec * 1000);
       }
+      actual_sleep_time.tv_nsec = target_sleep_time.tv_nsec - (loop_end_time.tv_usec * 1000);
+      
     }
     
+    // Sleep the loop and give an opportunity to cancel the thread.
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
     nanosleep(&actual_sleep_time, NULL);
-    
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
   }
   return NULL;
@@ -379,8 +405,8 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
   // Reason 1: Prevent a race condition with the manual terminal size check
   // Reason 2: Cause the new thread to inherit masked signals so that they are only handled in this thread
   sigset_t old_signal_mask;
+  sigset_t add_signal_mask;
   {
-    sigset_t add_signal_mask;
     if (sigemptyset(&old_signal_mask) == -1) {
       exit(5);
     }
