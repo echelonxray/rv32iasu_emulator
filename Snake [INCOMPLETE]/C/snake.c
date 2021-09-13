@@ -377,8 +377,6 @@ void* game_loop(void *thread_info) {
 }
 
 signed int main(signed int argc, char *argv[], char *envp[]) {
-  unsigned int exit_code = 0;
-  
   // Seed the PRNG
   {
     time_t s = time(NULL);
@@ -388,20 +386,7 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
     srand((unsigned int)(s % INT_MAX));
   }
   
-  // Setup the Signal Handler for Terminal Resize Events
-  {
-    struct sigaction sig_action;
-    sig_action.sa_handler = &signal_handle;
-    sigemptyset(&(sig_action.sa_mask));
-    sig_action.sa_flags = 0;
-    signed int retval = sigaction(SIGWINCH, &sig_action, NULL);
-    if (retval == -1) {
-      //dprintf(STDOUT, "Error - sigaction failed with errno %d: %s\n", errno, strerror(errno));
-      exit(1);
-    }
-  }
-  
-  // Mask Signal Handlers
+  // Mask Signal: SIGWINCH
   // Reason 1: Prevent a race condition with the manual terminal size check
   // Reason 2: Cause the new thread to inherit masked signals so that they are only handled in this thread
   sigset_t old_signal_mask;
@@ -418,6 +403,19 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
     }
     if (sigprocmask(SIG_BLOCK, &add_signal_mask, &old_signal_mask) == -1) {
       exit(8);
+    }
+  }
+  
+  // Setup the Signal Handler for Terminal Resize Events
+  {
+    struct sigaction sig_action;
+    sig_action.sa_handler = &signal_handle;
+    sigemptyset(&(sig_action.sa_mask));
+    sig_action.sa_flags = 0;
+    signed int retval = sigaction(SIGWINCH, &sig_action, NULL);
+    if (retval == -1) {
+      //dprintf(STDOUT, "Error - sigaction failed with errno %d: %s\n", errno, strerror(errno));
+      exit(1);
     }
   }
   
@@ -470,29 +468,40 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
   rand_food_location(&food, &snake, grid_width, grid_height);
   
   // Create a New Thread for the Game Loop
-  sem_init(&sem0, 0, 1);
-  sem_wait(&sem0);
   pthread_t pthread_id;
   struct ThreadInfo th_info;
-  th_info.snake = &snake;
-  th_info.food = &food;
-  th_info.display_content = display_content;
-  if (pthread_create(&pthread_id, NULL, &game_loop, (void*)&th_info) != 0) {
-    exit(10);
+  {
+    th_info.snake = &snake;
+    th_info.food = &food;
+    th_info.display_content = display_content;
+    sem_init(&sem0, 0, 1);
+    sem_wait(&sem0);
+    if (pthread_create(&pthread_id, NULL, &game_loop, (void*)&th_info) != 0) {
+      exit(10);
+    }
   }
   
   // START: Setup the Terminal
   // Set TTY to Raw mode
   struct termios old_tty_settings;
-  struct termios raw_tty_settings;
-  ioctl(STDOUT, TCGETS, &old_tty_settings);
-  memcpy(&raw_tty_settings, &old_tty_settings, sizeof(struct termios));
-  raw_tty_settings.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
-  raw_tty_settings.c_oflag &= ~OPOST;
-  raw_tty_settings.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
-  raw_tty_settings.c_cflag &= ~(CSIZE | PARENB);
-  raw_tty_settings.c_cflag |= CS8;
-  ioctl(STDOUT, TCSETS, &raw_tty_settings);
+  {
+    struct termios raw_tty_settings;
+    signed int retval;
+    retval = ioctl(STDOUT, TCGETS, &old_tty_settings);
+    if (retval == -1) {
+      exit(25);
+    }
+    memcpy(&raw_tty_settings, &old_tty_settings, sizeof(struct termios));
+    raw_tty_settings.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
+    raw_tty_settings.c_oflag &= ~OPOST;
+    raw_tty_settings.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+    raw_tty_settings.c_cflag &= ~(CSIZE | PARENB);
+    raw_tty_settings.c_cflag |= CS8;
+    retval = ioctl(STDOUT, TCSETS, &raw_tty_settings);
+    if (retval == -1) {
+      exit(26);
+    }
+  }
   
   // Disable the cursor
   dprintf(STDOUT, "\x1b[?25l");
@@ -503,17 +512,15 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
   pfd.fd = STDIN;
   pfd.events = POLLIN;
   
-  // Render and Draw the Grid
-  //regen_buffer(display_content, &snake, &food, grid_width, grid_height);
-  //dprintf(STDOUT, "\x1b[%d;%dH", 1, 1); // Move the cursor to row 1, column 1
-  //dprintf(STDOUT, "%s", display_content);
-  
   sem_post(&sem0);
+  
   // Unmask Signal Handlers for This Thread
+  // This should occur after the thread lock is released to begin normal game play
   if (pthread_sigmask(SIG_SETMASK, &old_signal_mask, NULL) != 0) {
     exit(9);
   }
   
+  unsigned int exit_code = 0;
   // Main Event Loop
   while (1) {
     // Listen for key-presses (Data) on STDIN
@@ -521,7 +528,7 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
     if (retval > 0) {
       if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
         // Unhanded or Fault condition
-        exit_code = 3;
+        exit_code = 1;
         break;
       } else {
         // POLLIN: Data received on STDIN
@@ -563,11 +570,13 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
       // EINTR (Signal received while polling) 
       // In this case, simply restart polling.
       if (errno != EINTR) {
-        exit_code = 4;
+        exit_code = 2;
         break;
       }
     }
   }
+  
+  // Clean up and exit:
   
   // START: Restore the Terminal
   // Enable the cursor
@@ -577,9 +586,12 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
   ioctl(STDOUT, TCSETS, &old_tty_settings);
   // END: Restore the Terminal
   
+  // Join the threads here
   pthread_cancel(pthread_id);
   pthread_join(pthread_id, NULL);
   
+  // Don't allow the interrupt handler function to interrupt program flow past this point.  
+  // This is to help prevent race conditions. (Though, none exist as of writing this comment)  
   if (sigprocmask(SIG_BLOCK, &add_signal_mask, NULL) == -1) {
     exit(11 + exit_code);
   }
@@ -590,6 +602,10 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
   free(display_content);
   
   dprintf(STDOUT, "\n");
+  
+  if (exit_code > 0) {
+    exit_code += 50;
+  }
   
   return exit_code;
 }
