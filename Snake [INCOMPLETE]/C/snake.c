@@ -7,6 +7,7 @@
 #include <termios.h>
 #include <signal.h>
 #include <semaphore.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <limits.h>
 #include <pthread.h>
@@ -68,11 +69,30 @@ struct ThreadInfo {
 void signal_handle(signed int sig_number) {
   // Signal Handler
   
-  // Get the terminal size
-  struct winsize term_size;
-  ioctl(STDOUT, TIOCGWINSZ, &term_size);
-  term_width = term_size.ws_col;
-  term_height = term_size.ws_row;
+  if        (sig_number == SIGWINCH) {
+    // Running in execution context of parent thread: User Input
+    // Terminal Resize Event
+    
+    // Get the terminal size
+    struct winsize term_size;
+    ioctl(STDOUT, TIOCGWINSZ, &term_size);
+    term_width = term_size.ws_col;
+    term_height = term_size.ws_row;
+  } else if (sig_number == SIGRTMIN + 0) {
+    // Running in execution context of child thread: Game Loop
+    // Pause Event
+    // The entirety of this execution pathway from function call to return 
+    //   occurs in a state of enabled pthread thread cancellability.
+    
+    sigset_t wait_signal;
+    if (sigemptyset(&wait_signal) == -1) {
+      return;
+    }
+    if (sigaddset(&wait_signal, SIGRTMIN + 0) == -1) {
+      return;
+    }
+    sigwaitinfo(&wait_signal, NULL);
+  }
 }
 
 signed int gen_random_number(signed int min, signed int max) {
@@ -312,6 +332,11 @@ void* game_loop(void *thread_info) {
   struct GridCell *food = th_info->food;
   char *display_content = th_info->display_content;
   
+  // TODO: Review error codes and error handling for sigemptyset and sigaddset
+  sigset_t wait_signal;
+  sigemptyset(&wait_signal);
+  sigaddset(&wait_signal, SIGRTMIN + 0);
+  
   // Game Loop
   while (1) {
     // Get processing start time
@@ -337,41 +362,58 @@ void* game_loop(void *thread_info) {
     struct timeval loop_end_time;
     gettimeofday(&loop_end_time, NULL);
     
-    // How much time elapsed while processing?
-    if (loop_end_time.tv_usec < loop_start_time.tv_usec) {
-      loop_end_time.tv_sec--;
-      loop_end_time.tv_usec += (1000000 - loop_start_time.tv_usec);
-    } else {
-      loop_end_time.tv_usec -= loop_start_time.tv_usec;
-    }
-    loop_end_time.tv_sec -= loop_start_time.tv_sec;
-    
-    // Init nanosleep struct with time 0 in case processing took too long.
-    // nanosleep() much still be called to give the thread an opportunity to be cancelled.
-    struct timespec actual_sleep_time;
-    actual_sleep_time.tv_sec = 0;
-    actual_sleep_time.tv_nsec = 0;
-    
-    // Is the elapsed processing time less than the target sleep time?
-    if (((loop_end_time.tv_sec == target_sleep_time.tv_sec) && (((long)loop_end_time.tv_usec * 1000) < target_sleep_time.tv_nsec)) || \
-         (loop_end_time.tv_sec <  target_sleep_time.tv_sec)) {
+    // Thread sleep calculations, nanosleep(), interruptibility, and cancellability
+    {
+      pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+      // Allow thread interruptions for Game Pausing
+      // This thread must only be interruptible while cancellation is 
+      //   enabled to prevent it from hanging on sigwaitinfo() during a 
+      //   pause-quit event outside of nanosleep().
+      pthread_sigmask(SIG_UNBLOCK, &wait_signal, NULL);
       
-      // Set the nanosleep time to the target time remaining
-      actual_sleep_time.tv_sec = target_sleep_time.tv_sec - loop_end_time.tv_sec;
-      if ((long)loop_end_time.tv_usec * 1000 > target_sleep_time.tv_nsec) {
-        actual_sleep_time.tv_sec--;
-        actual_sleep_time.tv_nsec = (1000000l - loop_end_time.tv_usec) * 1000 + target_sleep_time.tv_nsec;
+      // How much time elapsed while processing?
+      if (loop_end_time.tv_usec < loop_start_time.tv_usec) {
+        loop_end_time.tv_sec--;
+        loop_end_time.tv_usec += (1000000 - loop_start_time.tv_usec);
       } else {
-        actual_sleep_time.tv_nsec = target_sleep_time.tv_nsec - ((long)loop_end_time.tv_usec * 1000);
+        loop_end_time.tv_usec -= loop_start_time.tv_usec;
       }
-      actual_sleep_time.tv_nsec = target_sleep_time.tv_nsec - (loop_end_time.tv_usec * 1000);
+      loop_end_time.tv_sec -= loop_start_time.tv_sec;
       
+      // Init nanosleep struct with time 0 in case processing took too long.
+      // nanosleep() much still be called to give the thread an opportunity to be cancelled.
+      struct timespec actual_sleep_time;
+      actual_sleep_time.tv_sec = 0;
+      actual_sleep_time.tv_nsec = 0;
+      
+      // Is the elapsed processing time less than the target sleep time?
+      if (((loop_end_time.tv_sec == target_sleep_time.tv_sec) && (((long)loop_end_time.tv_usec * 1000) < target_sleep_time.tv_nsec)) || \
+           (loop_end_time.tv_sec <  target_sleep_time.tv_sec)) {
+        
+        // Set the nanosleep time to the target time remaining
+        actual_sleep_time.tv_sec = target_sleep_time.tv_sec - loop_end_time.tv_sec;
+        if ((long)loop_end_time.tv_usec * 1000 > target_sleep_time.tv_nsec) {
+          actual_sleep_time.tv_sec--;
+          actual_sleep_time.tv_nsec = (1000000l - loop_end_time.tv_usec) * 1000 + target_sleep_time.tv_nsec;
+        } else {
+          actual_sleep_time.tv_nsec = target_sleep_time.tv_nsec - ((long)loop_end_time.tv_usec * 1000);
+        }
+        actual_sleep_time.tv_nsec = target_sleep_time.tv_nsec - (loop_end_time.tv_usec * 1000);
+        
+      }
+      
+      struct timespec rem_sleep_time;
+      while (nanosleep(&actual_sleep_time, &rem_sleep_time) == -1) {
+        if (errno != EINTR) {
+          break;
+        }
+        actual_sleep_time = rem_sleep_time;
+      }
+      
+      // Block thread interruptions for Game Pausing
+      pthread_sigmask(SIG_BLOCK, &wait_signal, NULL);
+      pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
     }
-    
-    // Sleep the loop and give an opportunity to cancel the thread.
-    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
-    nanosleep(&actual_sleep_time, NULL);
-    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
   }
   return NULL;
 }
@@ -386,9 +428,10 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
     srand((unsigned int)(s % INT_MAX));
   }
   
-  // Mask Signal: SIGWINCH
+  // Mask Signal: SIGWINCH, SIGRTMIN + 0
   // Reason 1: Prevent a race condition with the manual terminal size check
-  // Reason 2: Cause the new thread to inherit masked signals so that they are only handled in this thread
+  // Reason 2: Cause the new thread to inherit masked SIGWINCH so that it is only handled in this thread
+  // Reason 3: Cause the this thread to ignore SIGRTMIN + 0, so it can be handled in the new thread
   sigset_t old_signal_mask;
   sigset_t add_signal_mask;
   {
@@ -401,8 +444,14 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
     if (sigaddset(&add_signal_mask, SIGWINCH) == -1) {
       exit(7);
     }
+    if (sigaddset(&add_signal_mask, SIGRTMIN + 0) == -1) {
+      exit(27);
+    }
     if (sigprocmask(SIG_BLOCK, &add_signal_mask, &old_signal_mask) == -1) {
       exit(8);
+    }
+    if (sigaddset(&old_signal_mask, SIGRTMIN + 0) == -1) {
+      exit(28);
     }
   }
   
@@ -414,8 +463,19 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
     sig_action.sa_flags = 0;
     signed int retval = sigaction(SIGWINCH, &sig_action, NULL);
     if (retval == -1) {
-      //dprintf(STDOUT, "Error - sigaction failed with errno %d: %s\n", errno, strerror(errno));
       exit(1);
+    }
+  }
+  
+  // Setup the Signal Handler for Pause Notifications
+  {
+    struct sigaction sig_action;
+    sig_action.sa_handler = &signal_handle;
+    sigemptyset(&(sig_action.sa_mask));
+    sig_action.sa_flags = 0;
+    signed int retval = sigaction(SIGRTMIN + 0, &sig_action, NULL);
+    if (retval == -1) {
+      exit(29);
     }
   }
   
@@ -520,6 +580,7 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
     exit(9);
   }
   
+  unsigned int not_paused = 1;
   unsigned int exit_code = 0;
   // Main Event Loop
   while (1) {
@@ -537,31 +598,38 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
         if        (data == 'q' || data == 'Q') {
           break;
         } else if (data == 'e' || data == 'E') {
-          // TODO: Pause
-        } else if (data == 'w' || data == 'W') {
-          sem_wait(&sem0);
-          if (snake.direction == DIR_UP || snake.direction == DIR_LEFT || snake.direction == DIR_RIGHT) {
-            snake.new_direction = DIR_UP;
+          // Dispatch Pause signal to Game Loop thread
+          kill(0, SIGRTMIN + 0);
+          not_paused = !not_paused;
+        } else {
+          // Game input should not be accepted if the game is paused
+          if (not_paused) {
+            if (data == 'w' || data == 'W') {
+              sem_wait(&sem0);
+              if (snake.direction == DIR_UP || snake.direction == DIR_LEFT || snake.direction == DIR_RIGHT) {
+                snake.new_direction = DIR_UP;
+              }
+              sem_post(&sem0);
+            } else if (data == 's' || data == 'S') {
+              sem_wait(&sem0);
+              if (snake.direction == DIR_DOWN || snake.direction == DIR_LEFT || snake.direction == DIR_RIGHT) {
+                snake.new_direction = DIR_DOWN;
+              }
+              sem_post(&sem0);
+            } else if (data == 'a' || data == 'A') {
+              sem_wait(&sem0);
+              if (snake.direction == DIR_UP || snake.direction == DIR_LEFT || snake.direction == DIR_DOWN) {
+                snake.new_direction = DIR_LEFT;
+              }
+              sem_post(&sem0);
+            } else if (data == 'd' || data == 'D') {
+              sem_wait(&sem0);
+              if (snake.direction == DIR_UP || snake.direction == DIR_RIGHT || snake.direction == DIR_DOWN) {
+                snake.new_direction = DIR_RIGHT;
+              }
+              sem_post(&sem0);
+            }
           }
-          sem_post(&sem0);
-        } else if (data == 's' || data == 'S') {
-          sem_wait(&sem0);
-          if (snake.direction == DIR_DOWN || snake.direction == DIR_LEFT || snake.direction == DIR_RIGHT) {
-            snake.new_direction = DIR_DOWN;
-          }
-          sem_post(&sem0);
-        } else if (data == 'a' || data == 'A') {
-          sem_wait(&sem0);
-          if (snake.direction == DIR_UP || snake.direction == DIR_LEFT || snake.direction == DIR_DOWN) {
-            snake.new_direction = DIR_LEFT;
-          }
-          sem_post(&sem0);
-        } else if (data == 'd' || data == 'D') {
-          sem_wait(&sem0);
-          if (snake.direction == DIR_UP || snake.direction == DIR_RIGHT || snake.direction == DIR_DOWN) {
-            snake.new_direction = DIR_RIGHT;
-          }
-          sem_post(&sem0);
         }
       }
     } else if (retval < 0) {
