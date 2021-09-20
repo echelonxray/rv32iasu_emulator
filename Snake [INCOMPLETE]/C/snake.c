@@ -7,7 +7,6 @@
 #include <termios.h>
 #include <signal.h>
 #include <semaphore.h>
-#include <fcntl.h>
 #include <unistd.h>
 #include <limits.h>
 #include <pthread.h>
@@ -22,6 +21,8 @@
 #define DIR_DOWN 1
 #define DIR_LEFT 2
 #define DIR_RIGHT 3
+
+#define USIG_PAUSE (SIGRTMIN + 0)
 
 // START: Build-Time Configuration Definitions
 
@@ -66,6 +67,15 @@ struct ThreadInfo {
   char *display_content;
 };
 
+void sem_wai2(sem_t *sem) {
+  while (sem_wait(sem) == -1) {
+    if (errno != EINTR) {
+      return;
+    }
+  }
+  return;
+}
+
 void signal_handle(signed int sig_number) {
   // Signal Handler
   
@@ -76,21 +86,18 @@ void signal_handle(signed int sig_number) {
     // Get the terminal size
     struct winsize term_size;
     ioctl(STDOUT, TIOCGWINSZ, &term_size);
+    // TODO: Consider checking ioctl return value
     term_width = term_size.ws_col;
     term_height = term_size.ws_row;
-  } else if (sig_number == SIGRTMIN + 0) {
+  } else if (sig_number == USIG_PAUSE) {
     // Running in execution context of child thread: Game Loop
     // Pause Event
     // The entirety of this execution pathway from function call to return 
     //   occurs in a state of enabled pthread thread cancellability.
     
     sigset_t wait_signal;
-    if (sigemptyset(&wait_signal) == -1) {
-      return;
-    }
-    if (sigaddset(&wait_signal, SIGRTMIN + 0) == -1) {
-      return;
-    }
+    sigemptyset(&wait_signal);
+    sigaddset(&wait_signal, USIG_PAUSE);
     sigwaitinfo(&wait_signal, NULL);
   }
 }
@@ -332,10 +339,9 @@ void* game_loop(void *thread_info) {
   struct GridCell *food = th_info->food;
   char *display_content = th_info->display_content;
   
-  // TODO: Review error codes and error handling for sigemptyset and sigaddset
-  sigset_t wait_signal;
-  sigemptyset(&wait_signal);
-  sigaddset(&wait_signal, SIGRTMIN + 0);
+  sigset_t pause_signal;
+  sigemptyset(&pause_signal);
+  sigaddset(&pause_signal, USIG_PAUSE);
   
   // Game Loop
   while (1) {
@@ -349,7 +355,7 @@ void* game_loop(void *thread_info) {
     // --Use the newly generated data to renderer the display buffer
     // --Print/Draw the display buffer
     // --Release the lock
-    sem_wait(&sem0);
+    sem_wai2(&sem0);
     snake_crawl(snake, food, grid_width, grid_height);
     regen_buffer(display_content, snake, food, grid_width, grid_height);
     dprintf(STDOUT, "\x1b[%d;%dH%s", 1, 1, display_content);
@@ -369,7 +375,7 @@ void* game_loop(void *thread_info) {
       // This thread must only be interruptible while cancellation is 
       //   enabled to prevent it from hanging on sigwaitinfo() during a 
       //   pause-quit event outside of nanosleep().
-      pthread_sigmask(SIG_UNBLOCK, &wait_signal, NULL);
+      pthread_sigmask(SIG_UNBLOCK, &pause_signal, NULL);
       
       // How much time elapsed while processing?
       if (loop_end_time.tv_usec < loop_start_time.tv_usec) {
@@ -411,7 +417,7 @@ void* game_loop(void *thread_info) {
       }
       
       // Block thread interruptions for Game Pausing
-      pthread_sigmask(SIG_BLOCK, &wait_signal, NULL);
+      pthread_sigmask(SIG_BLOCK, &pause_signal, NULL);
       pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
     }
   }
@@ -419,6 +425,7 @@ void* game_loop(void *thread_info) {
 }
 
 signed int main(signed int argc, char *argv[], char *envp[]) {
+  
   // Seed the PRNG
   {
     time_t s = time(NULL);
@@ -428,31 +435,19 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
     srand((unsigned int)(s % INT_MAX));
   }
   
-  // Mask Signal: SIGWINCH, SIGRTMIN + 0
+  // Mask Signal: SIGWINCH, USIG_PAUSE
   // Reason 1: Prevent a race condition with the manual terminal size check
   // Reason 2: Cause the new thread to inherit masked SIGWINCH so that it is only handled in this thread
-  // Reason 3: Cause the this thread to ignore SIGRTMIN + 0, so it can be handled in the new thread
+  // Reason 3: Cause the this thread to ignore USIG_PAUSE, so it can be handled in the new thread
   sigset_t old_signal_mask;
   sigset_t add_signal_mask;
   {
-    if (sigemptyset(&old_signal_mask) == -1) {
-      exit(5);
-    }
-    if (sigemptyset(&add_signal_mask) == -1) {
-      exit(6);
-    }
-    if (sigaddset(&add_signal_mask, SIGWINCH) == -1) {
-      exit(7);
-    }
-    if (sigaddset(&add_signal_mask, SIGRTMIN + 0) == -1) {
-      exit(27);
-    }
-    if (sigprocmask(SIG_BLOCK, &add_signal_mask, &old_signal_mask) == -1) {
-      exit(8);
-    }
-    if (sigaddset(&old_signal_mask, SIGRTMIN + 0) == -1) {
-      exit(28);
-    }
+    sigemptyset(&old_signal_mask);
+    sigemptyset(&add_signal_mask);
+    sigaddset(&add_signal_mask, SIGWINCH);
+    sigaddset(&add_signal_mask, USIG_PAUSE);
+    sigprocmask(SIG_BLOCK, &add_signal_mask, &old_signal_mask);
+    sigaddset(&old_signal_mask, USIG_PAUSE);
   }
   
   // Setup the Signal Handler for Terminal Resize Events
@@ -461,10 +456,7 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
     sig_action.sa_handler = &signal_handle;
     sigemptyset(&(sig_action.sa_mask));
     sig_action.sa_flags = 0;
-    signed int retval = sigaction(SIGWINCH, &sig_action, NULL);
-    if (retval == -1) {
-      exit(1);
-    }
+    sigaction(SIGWINCH, &sig_action, NULL);
   }
   
   // Setup the Signal Handler for Pause Notifications
@@ -473,10 +465,7 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
     sig_action.sa_handler = &signal_handle;
     sigemptyset(&(sig_action.sa_mask));
     sig_action.sa_flags = 0;
-    signed int retval = sigaction(SIGRTMIN + 0, &sig_action, NULL);
-    if (retval == -1) {
-      exit(29);
-    }
+    sigaction(USIG_PAUSE, &sig_action, NULL);
   }
   
   // Determine the terminal size
@@ -535,7 +524,7 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
     th_info.food = &food;
     th_info.display_content = display_content;
     sem_init(&sem0, 0, 1);
-    sem_wait(&sem0);
+    sem_wai2(&sem0);
     if (pthread_create(&pthread_id, NULL, &game_loop, (void*)&th_info) != 0) {
       exit(10);
     }
@@ -576,9 +565,7 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
   
   // Unmask Signal Handlers for This Thread
   // This should occur after the thread lock is released to begin normal game play
-  if (pthread_sigmask(SIG_SETMASK, &old_signal_mask, NULL) != 0) {
-    exit(9);
-  }
+  pthread_sigmask(SIG_SETMASK, &old_signal_mask, NULL);
   
   unsigned int not_paused = 1;
   unsigned int exit_code = 0;
@@ -599,31 +586,31 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
           break;
         } else if (data == 'e' || data == 'E') {
           // Dispatch Pause signal to Game Loop thread
-          kill(0, SIGRTMIN + 0);
+          kill(0, USIG_PAUSE);
           not_paused = !not_paused;
         } else {
           // Game input should not be accepted if the game is paused
           if (not_paused) {
             if (data == 'w' || data == 'W') {
-              sem_wait(&sem0);
+              sem_wai2(&sem0);
               if (snake.direction == DIR_UP || snake.direction == DIR_LEFT || snake.direction == DIR_RIGHT) {
                 snake.new_direction = DIR_UP;
               }
               sem_post(&sem0);
             } else if (data == 's' || data == 'S') {
-              sem_wait(&sem0);
+              sem_wai2(&sem0);
               if (snake.direction == DIR_DOWN || snake.direction == DIR_LEFT || snake.direction == DIR_RIGHT) {
                 snake.new_direction = DIR_DOWN;
               }
               sem_post(&sem0);
             } else if (data == 'a' || data == 'A') {
-              sem_wait(&sem0);
+              sem_wai2(&sem0);
               if (snake.direction == DIR_UP || snake.direction == DIR_LEFT || snake.direction == DIR_DOWN) {
                 snake.new_direction = DIR_LEFT;
               }
               sem_post(&sem0);
             } else if (data == 'd' || data == 'D') {
-              sem_wait(&sem0);
+              sem_wai2(&sem0);
               if (snake.direction == DIR_UP || snake.direction == DIR_RIGHT || snake.direction == DIR_DOWN) {
                 snake.new_direction = DIR_RIGHT;
               }
@@ -646,6 +633,10 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
   
   // Clean up and exit:
   
+  // Join the threads here
+  pthread_cancel(pthread_id);
+  pthread_join(pthread_id, NULL);
+  
   // START: Restore the Terminal
   // Enable the cursor
   dprintf(STDOUT, "\x1b[?25h");
@@ -654,15 +645,9 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
   ioctl(STDOUT, TCSETS, &old_tty_settings);
   // END: Restore the Terminal
   
-  // Join the threads here
-  pthread_cancel(pthread_id);
-  pthread_join(pthread_id, NULL);
-  
   // Don't allow the interrupt handler function to interrupt program flow past this point.  
   // This is to help prevent race conditions. (Though, none exist as of writing this comment)  
-  if (sigprocmask(SIG_BLOCK, &add_signal_mask, NULL) == -1) {
-    exit(11 + exit_code);
-  }
+  sigprocmask(SIG_BLOCK, &add_signal_mask, NULL);
   sem_destroy(&sem0);
   
   // Free the memory
