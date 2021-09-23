@@ -78,6 +78,7 @@ void sem_wai2(sem_t *sem) {
 
 void signal_handle(signed int sig_number) {
   // Signal Handler
+  int errno_backup = errno; // Save errno from interrupted thread.
   
   if        (sig_number == SIGWINCH) {
     // Running in execution context of parent thread: User Input
@@ -100,6 +101,9 @@ void signal_handle(signed int sig_number) {
     sigaddset(&wait_signal, USIG_PAUSE);
     sigwaitinfo(&wait_signal, NULL);
   }
+  
+  errno = errno_backup; // Restore errno from interrupted thread.
+  return;
 }
 
 signed int gen_random_number(signed int min, signed int max) {
