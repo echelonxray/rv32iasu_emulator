@@ -42,11 +42,13 @@
 
 // END: Build-Time Configuration Definitions
 
-volatile unsigned int term_width;
-volatile unsigned int term_height;
+unsigned int not_paused;
+unsigned int term_width;
+unsigned int term_height;
 unsigned int grid_width;
 unsigned int grid_height;
 sem_t sem0;
+sem_t sem1;
 
 struct Snake {
   unsigned int new_direction;
@@ -79,11 +81,14 @@ void sem_wai2(sem_t *sem) {
 
 void signal_handle(signed int sig_number) {
   // Signal Handler
-  int errno_backup = errno; // Save errno from interrupted thread.
+  int errno_backup = errno; // Save errno from interrupted thread context.
   
   if        (sig_number == SIGWINCH) {
-    // Running in execution context of parent thread: User Input
+    // Running in execution context of child thread: Signal Listener
     // Terminal Resize Event
+    
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+    sem_wai2(&sem1);
     
     // Get the terminal size
     struct winsize term_size;
@@ -91,20 +96,57 @@ void signal_handle(signed int sig_number) {
     // TODO: Consider checking ioctl return value
     term_width = term_size.ws_col;
     term_height = term_size.ws_row;
+    
+    if (term_width != grid_width || term_height != grid_height) {
+      // Pause the game
+      
+      // Nothing to pause if already paused
+      if (not_paused) {
+        kill(0, USIG_PAUSE); // Dispatch Pause signal to Game Loop thread
+        
+        sigset_t wait_signal;
+        sigemptyset(&wait_signal);
+        sigaddset(&wait_signal, USIG_P_ACK);
+        sigwaitinfo(&wait_signal, NULL);
+        
+        not_paused = 0;
+      }
+    }
+    
+    // Clear the terminal
+    // Clear the scrollback buffer
+    // Reset the terminal cursor position to the top left
+    dprintf(STDOUT, "\e[1;1H\e[0J\e[2J\e[3J\e[1;1H");
+    
+    dprintf(STDOUT, "Game Paused\n\r");
+    dprintf(STDOUT, "Press E to unpause\n\r");
+    dprintf(STDOUT, "Press Q to quit\n\r");
+    dprintf(STDOUT, "Press M to leave the current game and return to the menu (Not Implemented)\n\r");
+    dprintf(STDOUT, "Expected terminal size for current game: %dx%d\n\r", grid_width, grid_height);
+    dprintf(STDOUT, "Current terminal size: %dx%d\n\r", term_width, term_height);
+    dprintf(STDOUT, "The terminal size must match the expected size before unpause will be allowed.\n\r");
+    
+    sem_post(&sem1);
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
   } else if (sig_number == USIG_PAUSE) {
     // Running in execution context of child thread: Game Loop
     // Pause Event
     // The entirety of this execution pathway from function call to return 
     //   occurs in a state of enabled pthread thread cancellability.
     
+    // Inform the other thread that pause has been received 
+    // and is now being handled.  The other thread can now 
+    // take over display drawing until unpaused.
     kill(0, USIG_P_ACK);
+    
+    // Wait for unpause (Another USIG_PAUSE signal)
     sigset_t wait_signal;
     sigemptyset(&wait_signal);
     sigaddset(&wait_signal, USIG_PAUSE);
     sigwaitinfo(&wait_signal, NULL);
   }
   
-  errno = errno_backup; // Restore errno from interrupted thread.
+  errno = errno_backup; // Restore errno from interrupted thread context.
   return;
 }
 
@@ -221,7 +263,7 @@ void regen_buffer(char *buffer, struct Snake *snake, struct GridCell *food, unsi
     // This can be disabled by setting the above preprocessor definition, 'NOEXPLICITNEWLINES'
     *buffer = '\n';
     buffer++;
-    *buffer = '\x0d';
+    *buffer = '\r';
     buffer++;
 #endif
     
@@ -364,7 +406,7 @@ void* game_loop(void *thread_info) {
     sem_wai2(&sem0);
     snake_crawl(snake, food, grid_width, grid_height);
     regen_buffer(display_content, snake, food, grid_width, grid_height);
-    dprintf(STDOUT, "\x1b[%d;%dH%s", 1, 1, display_content);
+    dprintf(STDOUT, "\e[%d;%dH%s", 1, 1, display_content);
     sem_post(&sem0);
     
     // The rest of the loop below calculates sleep time and sleeps while 
@@ -430,6 +472,25 @@ void* game_loop(void *thread_info) {
   return NULL;
 }
 
+void* signal_receiver_thread(void *arg) {
+  struct timespec sleep_time;
+  sleep_time.tv_sec = 10;
+  sleep_time.tv_nsec = 0;
+  
+  {
+    sigset_t del_signal_mask;
+    sigemptyset(&del_signal_mask);
+    sigaddset(&del_signal_mask, SIGWINCH);
+    pthread_sigmask(SIG_UNBLOCK, &del_signal_mask, NULL);
+  }
+  
+  while (1) {
+    nanosleep(&sleep_time, NULL);
+  }
+  
+  return NULL;
+}
+
 signed int main(signed int argc, char *argv[], char *envp[]) {
   
   // Seed the PRNG
@@ -441,21 +502,14 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
     srand((unsigned int)(s % INT_MAX));
   }
   
-  // Mask Signal: SIGWINCH, USIG_PAUSE
-  // Reason 1: Prevent a race condition with the manual terminal size check
-  // Reason 2: Cause the new thread to inherit masked SIGWINCH so that it is only handled in this thread
-  // Reason 3: Cause the this thread to ignore USIG_PAUSE, so it can be handled in the new thread
-  sigset_t old_signal_mask;
+  // Mask Signal: SIGWINCH, USIG_PAUSE, USIG_P_ACK
   sigset_t add_signal_mask;
   {
-    sigemptyset(&old_signal_mask);
     sigemptyset(&add_signal_mask);
     sigaddset(&add_signal_mask, SIGWINCH);
     sigaddset(&add_signal_mask, USIG_PAUSE);
     sigaddset(&add_signal_mask, USIG_P_ACK);
-    sigprocmask(SIG_BLOCK, &add_signal_mask, &old_signal_mask);
-    sigaddset(&old_signal_mask, USIG_PAUSE);
-    sigaddset(&old_signal_mask, USIG_P_ACK);
+    sigprocmask(SIG_BLOCK, &add_signal_mask, NULL);
   }
   
   // Setup the Signal Handler for Terminal Resize Events
@@ -478,7 +532,12 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
   
   // Determine the terminal size
   {
-    signal_handle(SIGWINCH); // Pretend that a SIGWINCH was received
+    // Get the terminal size
+    struct winsize term_size;
+    ioctl(STDOUT, TIOCGWINSZ, &term_size);
+    // TODO: Consider checking ioctl return value
+    term_width = term_size.ws_col;
+    term_height = term_size.ws_row;
     grid_width = term_width;
     grid_height = term_height;
   }
@@ -524,20 +583,6 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
   struct GridCell food;
   rand_food_location(&food, &snake, grid_width, grid_height);
   
-  // Create a New Thread for the Game Loop
-  pthread_t pthread_id;
-  struct ThreadInfo th_info;
-  {
-    th_info.snake = &snake;
-    th_info.food = &food;
-    th_info.display_content = display_content;
-    sem_init(&sem0, 0, 1);
-    sem_wai2(&sem0);
-    if (pthread_create(&pthread_id, NULL, &game_loop, (void*)&th_info) != 0) {
-      exit(10);
-    }
-  }
-  
   // START: Setup the Terminal
   // Set TTY to Raw mode
   struct termios old_tty_settings;
@@ -561,7 +606,12 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
   }
   
   // Disable the cursor
-  dprintf(STDOUT, "\x1b[?25l");
+  dprintf(STDOUT, "\e[?25l");
+  
+  // Clear the terminal
+  // Clear the scrollback buffer
+  // Reset the terminal cursor position to the top left
+  dprintf(STDOUT, "\e[1;1H\e[0J\e[2J\e[3J\e[1;1H");
   // END: Setup the Terminal
   
   // Init polling struct
@@ -569,13 +619,26 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
   pfd.fd = STDIN;
   pfd.events = POLLIN;
   
-  sem_post(&sem0);
+  not_paused = 1;
   
-  // Unmask Signal Handlers for This Thread
-  // This should occur after the thread lock is released to begin normal game play
-  pthread_sigmask(SIG_SETMASK, &old_signal_mask, NULL);
+  // Create a New Thread for the Game Loop
+  pthread_t pthread_id_gameloop;
+  pthread_t pthread_id_signals;
+  struct ThreadInfo th_info;
+  {
+    th_info.snake = &snake;
+    th_info.food = &food;
+    th_info.display_content = display_content;
+    sem_init(&sem0, 0, 1);
+    sem_init(&sem1, 0, 1);
+    if (pthread_create(&pthread_id_gameloop, NULL, &game_loop, (void*)&th_info) != 0) {
+      exit(10);
+    }
+    if (pthread_create(&pthread_id_signals, NULL, &signal_receiver_thread, NULL) != 0) {
+      exit(10);
+    }
+  }
   
-  unsigned int not_paused = 1;
   unsigned int exit_code = 0;
   // Main Event Loop
   while (1) {
@@ -593,15 +656,34 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
         if        (data == 'q' || data == 'Q') {
           break;
         } else if (data == 'e' || data == 'E') {
-          // Dispatch Pause signal to Game Loop thread
-          kill(0, USIG_PAUSE);
-          if (not_paused) {
-            sigset_t wait_signal;
-            sigemptyset(&wait_signal);
-            sigaddset(&wait_signal, USIG_P_ACK);
-            sigwaitinfo(&wait_signal, NULL);
+          sem_wai2(&sem1);
+          if (term_width == grid_width && term_height == grid_height) {
+            kill(0, USIG_PAUSE); // Dispatch Pause signal to Game Loop thread
+            if (not_paused) {
+              sigset_t wait_signal;
+              sigemptyset(&wait_signal);
+              sigaddset(&wait_signal, USIG_P_ACK);
+              sigwaitinfo(&wait_signal, NULL);
+              
+              not_paused = 0;
+              
+              // Clear the terminal
+              // Clear the scrollback buffer
+              // Reset the terminal cursor position to the top left
+              dprintf(STDOUT, "\e[1;1H\e[0J\e[2J\e[3J\e[1;1H");
+              
+              dprintf(STDOUT, "Game Paused\n\r");
+              dprintf(STDOUT, "Press E to unpause\n\r");
+              dprintf(STDOUT, "Press Q to quit\n\r");
+              dprintf(STDOUT, "Press M to leave the current game and return to the menu (Not Implemented)\n\r");
+              dprintf(STDOUT, "Expected terminal size for current game: %dx%d\n\r", grid_width, grid_height);
+              dprintf(STDOUT, "Current terminal size: %dx%d\n\r", term_width, term_height);
+              dprintf(STDOUT, "The terminal size must match the expected size before unpause will be allowed.\n\r");
+            } else {
+              not_paused = 1;
+            }
           }
-          not_paused = !not_paused;
+          sem_post(&sem1);
         } else {
           // Game input should not be accepted if the game is paused
           if (not_paused) {
@@ -648,12 +730,14 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
   // Clean up and exit:
   
   // Join the threads here
-  pthread_cancel(pthread_id);
-  pthread_join(pthread_id, NULL);
+  pthread_cancel(pthread_id_gameloop);
+  pthread_cancel(pthread_id_signals);
+  pthread_join(pthread_id_gameloop, NULL);
+  pthread_join(pthread_id_signals, NULL);
   
   // START: Restore the Terminal
   // Enable the cursor
-  dprintf(STDOUT, "\x1b[?25h");
+  dprintf(STDOUT, "\e[?25h");
   
   // Restore the TTY to the original mode
   ioctl(STDOUT, TCSETS, &old_tty_settings);
