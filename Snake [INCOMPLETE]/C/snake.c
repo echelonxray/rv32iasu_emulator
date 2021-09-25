@@ -23,6 +23,7 @@
 #define DIR_RIGHT 3
 
 #define USIG_PAUSE (SIGRTMIN + 0)
+#define USIG_P_ACK (SIGRTMIN + 1)
 
 // START: Build-Time Configuration Definitions
 
@@ -96,6 +97,7 @@ void signal_handle(signed int sig_number) {
     // The entirety of this execution pathway from function call to return 
     //   occurs in a state of enabled pthread thread cancellability.
     
+    kill(0, USIG_P_ACK);
     sigset_t wait_signal;
     sigemptyset(&wait_signal);
     sigaddset(&wait_signal, USIG_PAUSE);
@@ -450,8 +452,10 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
     sigemptyset(&add_signal_mask);
     sigaddset(&add_signal_mask, SIGWINCH);
     sigaddset(&add_signal_mask, USIG_PAUSE);
+    sigaddset(&add_signal_mask, USIG_P_ACK);
     sigprocmask(SIG_BLOCK, &add_signal_mask, &old_signal_mask);
     sigaddset(&old_signal_mask, USIG_PAUSE);
+    sigaddset(&old_signal_mask, USIG_P_ACK);
   }
   
   // Setup the Signal Handler for Terminal Resize Events
@@ -591,6 +595,12 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
         } else if (data == 'e' || data == 'E') {
           // Dispatch Pause signal to Game Loop thread
           kill(0, USIG_PAUSE);
+          if (not_paused) {
+            sigset_t wait_signal;
+            sigemptyset(&wait_signal);
+            sigaddset(&wait_signal, USIG_P_ACK);
+            sigwaitinfo(&wait_signal, NULL);
+          }
           not_paused = !not_paused;
         } else {
           // Game input should not be accepted if the game is paused
