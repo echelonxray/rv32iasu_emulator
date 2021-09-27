@@ -42,7 +42,10 @@
 
 // END: Build-Time Configuration Definitions
 
+unsigned int score;
 unsigned int not_paused;
+unsigned int curr_term_width;
+unsigned int curr_term_height;
 unsigned int term_width;
 unsigned int term_height;
 unsigned int grid_width;
@@ -94,10 +97,10 @@ void signal_handle(signed int sig_number) {
     struct winsize term_size;
     ioctl(STDOUT, TIOCGWINSZ, &term_size);
     // TODO: Consider checking ioctl return value
-    term_width = term_size.ws_col;
-    term_height = term_size.ws_row;
+    curr_term_width = term_size.ws_col;
+    curr_term_height = term_size.ws_row;
     
-    if (term_width != grid_width || term_height != grid_height) {
+    if (term_width != curr_term_width || term_height != curr_term_height) {
       // Pause the game
       
       // Nothing to pause if already paused
@@ -122,8 +125,9 @@ void signal_handle(signed int sig_number) {
     dprintf(STDOUT, "Press E to unpause\n\r");
     dprintf(STDOUT, "Press Q to quit\n\r");
     dprintf(STDOUT, "Press M to leave the current game and return to the menu (Not Implemented)\n\r");
-    dprintf(STDOUT, "Expected terminal size for current game: %dx%d\n\r", grid_width, grid_height);
-    dprintf(STDOUT, "Current terminal size: %dx%d\n\r", term_width, term_height);
+    dprintf(STDOUT, "Current Score: %d\n\r", score);
+    dprintf(STDOUT, "Expected terminal size for current game: %dx%d\n\r", term_width, term_height);
+    dprintf(STDOUT, "Current terminal size: %dx%d\n\r", curr_term_width, curr_term_height);
     dprintf(STDOUT, "The terminal size must match the expected size before unpause will be allowed.\n\r");
     
     sem_post(&sem1);
@@ -189,7 +193,7 @@ void rand_food_location(struct GridCell *food, struct Snake *snake, unsigned int
     for (unsigned int x = 0; x < width; x++) {
       // Iterate through the snake to check if any cells occupy the space
       for (unsigned int j = 0; j < snake->length; j++) {
-        if (snake->cells[j].x == x && snake->cells[j].y == y) {
+        if (snake->cells[j].x == (signed int)x && snake->cells[j].y == (signed int)y) {
           the_grid_space++;
           // Break the loop because it is possible for a snake to have 
           // several cells on the same x, y coordinate.  However, we only 
@@ -223,14 +227,65 @@ void rand_food_location(struct GridCell *food, struct Snake *snake, unsigned int
   return;
 }
 
-void regen_buffer(char *buffer, struct Snake *snake, struct GridCell *food, unsigned int width, unsigned int height) {
+void regen_buffer(char *buffer, struct Snake *snake, struct GridCell *food) {
   // Render the Grid into the Buffer
   
-  for (unsigned int y = 0; y < height; y++) {
-    for (unsigned int x = 0; x < width; x++) {
+  // Render Line 1 with the Score Count
+  {
+    char format_string[24];
+    snprintf(format_string, 24, "Score: %%-%dd", term_width - 7);
+    snprintf(buffer, term_width + 1, format_string, score);
+    buffer += strlen(buffer);
+#ifndef NOEXPLICITNEWLINES
+    *buffer = '\n';
+    buffer++;
+    *buffer = '\r';
+    buffer++;
+#endif
+  }
+  
+  *buffer = 0xE2;
+  buffer++;
+  *buffer = 0x94;
+  buffer++;
+  *buffer = 0x8F;
+  buffer++;
+  for (unsigned int x = 0; x < grid_width; x++) {
+    *buffer = 0xE2;
+    buffer++;
+    *buffer = 0x94;
+    buffer++;
+    *buffer = 0x81;
+    buffer++;
+  }
+  *buffer = 0xE2;
+  buffer++;
+  *buffer = 0x94;
+  buffer++;
+  *buffer = 0x93;
+  buffer++;
+#ifndef NOEXPLICITNEWLINES
+  *buffer = '\n';
+  buffer++;
+  *buffer = '\r';
+  buffer++;
+#endif
+  
+  unsigned int snake_length = snake->length;
+  
+  for (unsigned int y = 0; y < grid_height; y++) {
+    
+    *buffer = 0xE2;
+    buffer++;
+    *buffer = 0x94;
+    buffer++;
+    *buffer = 0x83;
+    buffer++;
+    
+    for (unsigned int x = 0; x < grid_width; x++) {
       // Is this a Snake Cell?
-      for (unsigned int i = 0; i < snake->length; i++) {
-        if (snake->cells[i].x == x && snake->cells[i].y == y) {
+      for (unsigned int i = 0; i < snake_length; i++) {
+        if (snake->cells[i].x == (signed int)x && snake->cells[i].y == (signed int)y) {
           // Regen Snake Cell
           *buffer = '+';
           buffer++;
@@ -239,7 +294,7 @@ void regen_buffer(char *buffer, struct Snake *snake, struct GridCell *food, unsi
       }
       
       // Is this a Food Cell?
-      if (food->x == x && food->y == y) {
+      if (food->x == (signed int)x && food->y == (signed int)y) {
         // Regen Food Cell
         *buffer = 'x';
         buffer++;
@@ -253,6 +308,13 @@ void regen_buffer(char *buffer, struct Snake *snake, struct GridCell *food, unsi
       
       next_grid_cell:;
     }
+    
+    *buffer = 0xE2;
+    buffer++;
+    *buffer = 0x94;
+    buffer++;
+    *buffer = 0x83;
+    buffer++;
     
 #ifndef NOEXPLICITNEWLINES
     // In case we are running on a TTY that does not get up-to-date terminal size 
@@ -269,13 +331,28 @@ void regen_buffer(char *buffer, struct Snake *snake, struct GridCell *food, unsi
     
   }
   
-  // Make sure the string is NULL terminated
-#ifndef NOEXPLICITNEWLINES
-  // Do not add a new line to the last line
-  if (height > 0) {
-    buffer -= 2;
+  *buffer = 0xE2;
+  buffer++;
+  *buffer = 0x94;
+  buffer++;
+  *buffer = 0x97;
+  buffer++;
+  for (unsigned int x = 0; x < grid_width; x++) {
+    *buffer = 0xE2;
+    buffer++;
+    *buffer = 0x94;
+    buffer++;
+    *buffer = 0x81;
+    buffer++;
   }
-#endif
+  *buffer = 0xE2;
+  buffer++;
+  *buffer = 0x94;
+  buffer++;
+  *buffer = 0x9B;
+  buffer++;
+  
+  // Make sure the string is NULL terminated
   *buffer = 0;
   
   return;
@@ -295,8 +372,11 @@ void snake_append_cells(struct Snake *snake, unsigned int num_to_add) {
   return;
 }
 
-void snake_crawl(struct Snake *snake, struct GridCell *food, unsigned int width, unsigned int height) {
+void snake_crawl(struct Snake *snake, struct GridCell *food) {
   // Crawl Snake Forward
+  
+  unsigned int width = grid_width;
+  unsigned int height = grid_height;
   
   signed int prev_cell_x = snake->cells[0].x;
   signed int prev_cell_y = snake->cells[0].y;
@@ -320,11 +400,11 @@ void snake_crawl(struct Snake *snake, struct GridCell *food, unsigned int width,
   // Handle Wrapping
   if        (head_cell_x < 0) {
     head_cell_x += width;
-  } else if (head_cell_x >= width) {
+  } else if (head_cell_x >= (signed int)width) {
     head_cell_x -= width;
   } else if (head_cell_y < 0) {
     head_cell_y += height;
-  } else if (head_cell_y >= height) {
+  } else if (head_cell_y >= (signed int)height) {
     head_cell_y -= height;
   }
   
@@ -340,6 +420,7 @@ void snake_crawl(struct Snake *snake, struct GridCell *food, unsigned int width,
   // Did we consume food?
   if (head_cell_x == food->x && head_cell_y == food->y) {
     // Handle food consume
+    score += 1;
     snake_append_cells(snake, snake->grow_by);
     snake->grow_by += GROW_BY_INCREMENT;
     rand_food_location(food, snake, width, height);
@@ -404,8 +485,8 @@ void* game_loop(void *thread_info) {
     // --Print/Draw the display buffer
     // --Release the lock
     sem_wai2(&sem0);
-    snake_crawl(snake, food, grid_width, grid_height);
-    regen_buffer(display_content, snake, food, grid_width, grid_height);
+    snake_crawl(snake, food);
+    regen_buffer(display_content, snake, food);
     dprintf(STDOUT, "\e[%d;%dH%s", 1, 1, display_content);
     sem_post(&sem0);
     
@@ -422,7 +503,7 @@ void* game_loop(void *thread_info) {
       // Allow thread interruptions for Game Pausing
       // This thread must only be interruptible while cancellation is 
       //   enabled to prevent it from hanging on sigwaitinfo() during a 
-      //   pause-quit event outside of nanosleep().
+      //   pause-quit event outside of nanosleep().q
       pthread_sigmask(SIG_UNBLOCK, &pause_signal, NULL);
       
       // How much time elapsed while processing?
@@ -536,16 +617,18 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
     struct winsize term_size;
     ioctl(STDOUT, TIOCGWINSZ, &term_size);
     // TODO: Consider checking ioctl return value
-    term_width = term_size.ws_col;
-    term_height = term_size.ws_row;
-    grid_width = term_width;
-    grid_height = term_height;
+    curr_term_width = term_size.ws_col;
+    curr_term_height = term_size.ws_row;
+    term_width = curr_term_width;
+    term_height = curr_term_height;
+    grid_width = term_width - 2;
+    grid_height = term_height - 3;
   }
   
-  // Allocated the memory for the Grid
+  // Allocated the memory for the Display Buffer
   char* display_content = 0;
   {
-    unsigned int buffer_size = (grid_width + 1) * grid_height * sizeof(char) * 4;
+    unsigned int buffer_size = (term_width + 1) * term_height * sizeof(char) * 4;
     display_content = malloc(buffer_size);
     // TODO: Handle malloc failure
   }
@@ -620,6 +703,7 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
   pfd.events = POLLIN;
   
   not_paused = 1;
+  score = 0;
   
   // Create a New Thread for the Game Loop
   pthread_t pthread_id_gameloop;
@@ -657,7 +741,7 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
           break;
         } else if (data == 'e' || data == 'E') {
           sem_wai2(&sem1);
-          if (term_width == grid_width && term_height == grid_height) {
+          if (term_width == curr_term_width && term_height == curr_term_height) {
             kill(0, USIG_PAUSE); // Dispatch Pause signal to Game Loop thread
             if (not_paused) {
               sigset_t wait_signal;
@@ -676,8 +760,9 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
               dprintf(STDOUT, "Press E to unpause\n\r");
               dprintf(STDOUT, "Press Q to quit\n\r");
               dprintf(STDOUT, "Press M to leave the current game and return to the menu (Not Implemented)\n\r");
-              dprintf(STDOUT, "Expected terminal size for current game: %dx%d\n\r", grid_width, grid_height);
-              dprintf(STDOUT, "Current terminal size: %dx%d\n\r", term_width, term_height);
+              dprintf(STDOUT, "Current Score: %d\n\r", score);
+              dprintf(STDOUT, "Expected terminal size for current game: %dx%d\n\r", term_width, term_height);
+              dprintf(STDOUT, "Current terminal size: %dx%d\n\r", curr_term_width, curr_term_height);
               dprintf(STDOUT, "The terminal size must match the expected size before unpause will be allowed.\n\r");
             } else {
               not_paused = 1;
