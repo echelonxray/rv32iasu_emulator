@@ -502,7 +502,7 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
     srand((unsigned int)(s % INT_MAX));
   }
   
-  // Mask Signal: SIGWINCH, USIG_PAUSE, USIG_P_ACK
+  // Mask Signals: SIGWINCH, USIG_PAUSE, USIG_P_ACK
   sigset_t add_signal_mask;
   {
     sigemptyset(&add_signal_mask);
@@ -512,7 +512,7 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
     sigprocmask(SIG_BLOCK, &add_signal_mask, NULL);
   }
   
-  // Setup the Signal Handler for Terminal Resize Events
+  // Setup the Signal Handler for Terminal Resize Events (SIGWINCH)
   {
     struct sigaction sig_action;
     sig_action.sa_handler = &signal_handle;
@@ -521,7 +521,7 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
     sigaction(SIGWINCH, &sig_action, NULL);
   }
   
-  // Setup the Signal Handler for Pause Notifications
+  // Setup the Signal Handler for Pause Notifications (USIG_PAUSE)
   {
     struct sigaction sig_action;
     sig_action.sa_handler = &signal_handle;
@@ -734,6 +734,8 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
   pthread_cancel(pthread_id_signals);
   pthread_join(pthread_id_gameloop, NULL);
   pthread_join(pthread_id_signals, NULL);
+  sem_destroy(&sem0);
+  sem_destroy(&sem1);
   
   // START: Restore the Terminal
   // Enable the cursor
@@ -742,11 +744,6 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
   // Restore the TTY to the original mode
   ioctl(STDOUT, TCSETS, &old_tty_settings);
   // END: Restore the Terminal
-  
-  // Don't allow the interrupt handler function to interrupt program flow past this point.  
-  // This is to help prevent race conditions. (Though, none exist as of writing this comment)  
-  sigprocmask(SIG_BLOCK, &add_signal_mask, NULL);
-  sem_destroy(&sem0);
   
   // Free the memory
   free(snake.cells);
