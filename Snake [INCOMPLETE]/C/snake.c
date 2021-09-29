@@ -40,8 +40,176 @@
 // How long should the delay between ticks be in milliseconds?
 #define DELAY_TIME_MS 150
 
+// Border Cell: Vertical U+2503: ┃
+#define BORDER_VERTICAL(buffer_return, buffer_input) \
+  { \
+    buffer_return = buffer_input; \
+    *buffer_return = 0xE2; \
+    buffer_return++; \
+    *buffer_return = 0x94; \
+    buffer_return++; \
+    *buffer_return = 0x83; \
+    buffer_return++; \
+  }
+// Border Cell: Horizontal U+2501: ━
+#define BORDER_HORIZONTAL(buffer_return, buffer_input) \
+  { \
+    buffer_return = buffer_input; \
+    *buffer_return = 0xE2; \
+    buffer_return++; \
+    *buffer_return = 0x94; \
+    buffer_return++; \
+    *buffer_return = 0x81; \
+    buffer_return++; \
+  }
+// Border Cell: Top-Left Corner U+250F: ┏
+#define BORDER_CORNER_TOPLEFT(buffer_return, buffer_input) \
+  { \
+    buffer_return = buffer_input; \
+    *buffer_return = 0xE2; \
+    buffer_return++; \
+    *buffer_return = 0x94; \
+    buffer_return++; \
+    *buffer_return = 0x8F; \
+    buffer_return++; \
+  }
+// Border Cell: Top-Right Corner U+2513: ┓
+#define BORDER_CORNER_TOPRIGHT(buffer_return, buffer_input) \
+  { \
+    buffer_return = buffer_input; \
+    *buffer_return = 0xE2; \
+    buffer_return++; \
+    *buffer_return = 0x94; \
+    buffer_return++; \
+    *buffer_return = 0x93; \
+    buffer_return++; \
+  }
+// Border Cell: Bottom-Left Corner U+2517: ┗
+#define BORDER_CORNER_BOTTOMLEFT(buffer_return, buffer_input) \
+  { \
+    buffer_return = buffer_input; \
+    *buffer_return = 0xE2; \
+    buffer_return++; \
+    *buffer_return = 0x94; \
+    buffer_return++; \
+    *buffer_return = 0x97; \
+    buffer_return++; \
+  }
+// Border Cell: Bottom-Right Corner U+251B: ┛
+#define BORDER_CORNER_BOTTOMRIGHT(buffer_return, buffer_input) \
+  { \
+    buffer_return = buffer_input; \
+    *buffer_return = 0xE2; \
+    buffer_return++; \
+    *buffer_return = 0x94; \
+    buffer_return++; \
+    *buffer_return = 0x9B; \
+    buffer_return++; \
+  }
+
+// Snake Cell: Vertical U+2502: │
+#define SNAKE_CELL_TB(buffer_return, buffer_input) \
+  { \
+    buffer_return = buffer_input; \
+    *buffer_return = 0xE2; \
+    buffer_return++; \
+    *buffer_return = 0x94; \
+    buffer_return++; \
+    *buffer_return = 0x82; \
+    buffer_return++; \
+  }
+// Snake Cell: Horizontal U+2500: ─
+#define SNAKE_CELL_LR(buffer_return, buffer_input) \
+  { \
+    buffer_return = buffer_input; \
+    *buffer_return = 0xE2; \
+    buffer_return++; \
+    *buffer_return = 0x94; \
+    buffer_return++; \
+    *buffer_return = 0x80; \
+    buffer_return++; \
+  }
+// Snake Cell: Top-Left U+256F: ╯
+#define SNAKE_CELL_TL(buffer_return, buffer_input) \
+  { \
+    buffer_return = buffer_input; \
+    *buffer_return = 0xE2; \
+    buffer_return++; \
+    *buffer_return = 0x95; \
+    buffer_return++; \
+    *buffer_return = 0xAF; \
+    buffer_return++; \
+  }
+// Snake Cell: Top-Right U+2570: ╰
+#define SNAKE_CELL_TR(buffer_return, buffer_input) \
+  { \
+    buffer_return = buffer_input; \
+    *buffer_return = 0xE2; \
+    buffer_return++; \
+    *buffer_return = 0x95; \
+    buffer_return++; \
+    *buffer_return = 0xB0; \
+    buffer_return++; \
+  }
+// Snake Cell: Bottom-Left U+256E: ╮
+#define SNAKE_CELL_BL(buffer_return, buffer_input) \
+  { \
+    buffer_return = buffer_input; \
+    *buffer_return = 0xE2; \
+    buffer_return++; \
+    *buffer_return = 0x95; \
+    buffer_return++; \
+    *buffer_return = 0xAE; \
+    buffer_return++; \
+  }
+// Snake Cell: Bottom-Right U+256D: ╭
+#define SNAKE_CELL_BR(buffer_return, buffer_input) \
+  { \
+    buffer_return = buffer_input; \
+    *buffer_return = 0xE2; \
+    buffer_return++; \
+    *buffer_return = 0x95; \
+    buffer_return++; \
+    *buffer_return = 0xAD; \
+    buffer_return++; \
+  }
+
+#define FOOD_CELL(buffer_return, buffer_input) \
+  { \
+    buffer_return = buffer_input; \
+    *buffer_return = 0xE2; \
+    buffer_return++; \
+    *buffer_return = 0xAC; \
+    buffer_return++; \
+    *buffer_return = 0xA5; \
+    buffer_return++; \
+  }
+
+// Fallback Border: X
+#define FALLBACK_BORDER(buffer_return, buffer_input) \
+  { \
+    buffer_return = buffer_input; \
+    *buffer_return = 'X'; \
+    buffer_return++; \
+  }
+// Fallback Snake: +
+#define FALLBACK_SNAKE(buffer_return, buffer_input) \
+  { \
+    buffer_return = buffer_input; \
+    *buffer_return = '+'; \
+    buffer_return++; \
+  }
+// Fallback Food: F
+#define FALLBACK_FOOD_CELL(buffer_return, buffer_input) \
+  { \
+    buffer_return = buffer_input; \
+    *buffer_return = 'F'; \
+    buffer_return++; \
+  }
+
 // END: Build-Time Configuration Definitions
 
+unsigned int utf8_support = 1;
 unsigned int score;
 unsigned int not_paused;
 unsigned int curr_term_width;
@@ -73,13 +241,15 @@ struct ThreadInfo {
   char *display_content;
 };
 
-void sem_wai2(sem_t *sem) {
+int sem_wai2(sem_t *sem) {
+  // Wrapper sem_wait() to force a retry in the event of failure code EINTR
+  
   while (sem_wait(sem) == -1) {
     if (errno != EINTR) {
-      return;
+      return -1;
     }
   }
-  return;
+  return 0;
 }
 
 void signal_handle(signed int sig_number) {
@@ -128,7 +298,7 @@ void signal_handle(signed int sig_number) {
     dprintf(STDOUT, "Current Score: %d\n\r", score);
     dprintf(STDOUT, "Expected terminal size for current game: %dx%d\n\r", term_width, term_height);
     dprintf(STDOUT, "Current terminal size: %dx%d\n\r", curr_term_width, curr_term_height);
-    dprintf(STDOUT, "The terminal size must match the expected size before unpause will be allowed.\n\r");
+    dprintf(STDOUT, "The terminal size must match the expected size before unpause will be allowed.\r");
     
     sem_post(&sem1);
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
@@ -244,26 +414,18 @@ void regen_buffer(char *buffer, struct Snake *snake, struct GridCell *food) {
 #endif
   }
   
-  *buffer = 0xE2;
-  buffer++;
-  *buffer = 0x94;
-  buffer++;
-  *buffer = 0x8F;
-  buffer++;
-  for (unsigned int x = 0; x < grid_width; x++) {
-    *buffer = 0xE2;
-    buffer++;
-    *buffer = 0x94;
-    buffer++;
-    *buffer = 0x81;
-    buffer++;
+  // Render Top Grid Border
+  if (utf8_support) {
+    BORDER_CORNER_TOPLEFT(buffer, buffer);
+    for (unsigned int x = 0; x < grid_width; x++) {
+      BORDER_HORIZONTAL(buffer, buffer);
+    }
+    BORDER_CORNER_TOPRIGHT(buffer, buffer);
+  } else {
+    for (unsigned int x = 0; x < term_width; x++) {
+      FALLBACK_BORDER(buffer, buffer);
+    }
   }
-  *buffer = 0xE2;
-  buffer++;
-  *buffer = 0x94;
-  buffer++;
-  *buffer = 0x93;
-  buffer++;
 #ifndef NOEXPLICITNEWLINES
   *buffer = '\n';
   buffer++;
@@ -275,20 +437,264 @@ void regen_buffer(char *buffer, struct Snake *snake, struct GridCell *food) {
   
   for (unsigned int y = 0; y < grid_height; y++) {
     
-    *buffer = 0xE2;
-    buffer++;
-    *buffer = 0x94;
-    buffer++;
-    *buffer = 0x83;
-    buffer++;
+    // Render a Vertical Element of the Left Grid Border
+    if (utf8_support) {
+      BORDER_VERTICAL(buffer, buffer);
+    } else {
+      FALLBACK_BORDER(buffer, buffer);
+    }
     
     for (unsigned int x = 0; x < grid_width; x++) {
       // Is this a Snake Cell?
       for (unsigned int i = 0; i < snake_length; i++) {
         if (snake->cells[i].x == (signed int)x && snake->cells[i].y == (signed int)y) {
           // Regen Snake Cell
-          *buffer = '+';
-          buffer++;
+          if (utf8_support) {
+            // TODO: Clean this up.  This solution is nasty.
+            
+            if (i == 0) { // Collapse this decision tree for easier readability in your editor
+              // Head Of Snake
+              
+              // Select the correct arrow
+              if (snake->cells[1].x == (signed int)x) {
+                if (snake->cells[1].y > (signed int)y) {
+                  if (snake->cells[1].y - 1 != (signed int)y) {
+                    // Wrapping has occurred.  Treat as opposite direction.
+                    goto render_head_from_top;
+                  }
+                  // From Bottom
+                  render_head_from_bottom:
+                  
+                  if        (snake->new_direction == DIR_LEFT) {
+                    // Arrow Bottom to Left
+                    SNAKE_CELL_BL(buffer, buffer);
+                  } else if (snake->new_direction == DIR_RIGHT) {
+                    // Arrow Bottom to Right
+                    SNAKE_CELL_BR(buffer, buffer);
+                  } else {
+                    // Arrow Bottom to Top
+                    SNAKE_CELL_TB(buffer, buffer);
+                  }
+                } else {
+                  if (snake->cells[1].y + 1 != (signed int)y) {
+                    // Wrapping has occurred.  Treat as opposite direction.
+                    goto render_head_from_bottom;
+                  }
+                  // From Top
+                  render_head_from_top:
+                  
+                  if        (snake->new_direction == DIR_LEFT) {
+                    // Arrow Top to Left
+                    SNAKE_CELL_TL(buffer, buffer);
+                  } else if (snake->new_direction == DIR_RIGHT) {
+                    // Arrow Top to Right
+                    SNAKE_CELL_TR(buffer, buffer);
+                  } else {
+                    // Arrow Top to Bottom
+                    SNAKE_CELL_TB(buffer, buffer);
+                  }
+                }
+              } else {
+                if (snake->cells[1].x > (signed int)x) {
+                  if (snake->cells[1].x - 1 != (signed int)x) {
+                    // Wrapping has occurred.  Treat as opposite direction.
+                    goto render_head_from_left;
+                  }
+                  // From Right
+                  render_head_from_right:
+                  
+                  if        (snake->new_direction == DIR_UP) {
+                    // Arrow Right to Top
+                    SNAKE_CELL_TR(buffer, buffer);
+                  } else if (snake->new_direction == DIR_DOWN) {
+                    // Arrow Right to Down
+                    SNAKE_CELL_BR(buffer, buffer);
+                  } else {
+                    // Arrow Right to Left
+                    SNAKE_CELL_LR(buffer, buffer);
+                  }
+                } else {
+                  if (snake->cells[1].x + 1 != (signed int)x) {
+                    // Wrapping has occurred.  Treat as opposite direction.
+                    goto render_head_from_right;
+                  }
+                  // From Left
+                  render_head_from_left:
+                  
+                  if        (snake->new_direction == DIR_UP) {
+                    // Arrow Left to Top
+                    SNAKE_CELL_TL(buffer, buffer);
+                  } else if (snake->new_direction == DIR_DOWN) {
+                    // Arrow Left to Down
+                    SNAKE_CELL_BL(buffer, buffer);
+                  } else {
+                    // Arrow Left to Right
+                    SNAKE_CELL_LR(buffer, buffer);
+                  }
+                }
+              }
+            } else if (i == snake->length - 1) {
+              // Tail of the Snake
+              render_snake_tail:
+              
+              // Which direction is the previous cell?
+              if (snake->cells[i].x != snake->cells[i - 1].x) {
+                // Tail is Horizontal
+                SNAKE_CELL_LR(buffer, buffer);
+              } else {
+                // Tail is Vertical
+                SNAKE_CELL_TB(buffer, buffer);
+              }
+            } else {
+              if (snake->cells[i].x == snake->cells[i + 1].x && snake->cells[i].y == snake->cells[i + 1].y) {
+                // Snake is not yet fully extended from an earlier growth, but 
+                // this is the last effective cell.  Treat it as the last cell 
+                // by jumping into the code to handle that case.
+                goto render_snake_tail;
+              }
+              // Middle Cell of the Snake
+              
+              // Which direction is the Previous Cell?
+              if (snake->cells[i].x > snake->cells[i - 1].x) {
+                if (snake->cells[i].x - 1 != snake->cells[i - 1].x) {
+                  // Wrapping has occurred.  Treat as opposite direction.
+                  goto render_middle_from_right;
+                }
+                // Previous Cell is to the Left
+                render_middle_from_left:
+                
+                // Which direction is the Next Cell?
+                // Use Not Equals to ensure that this still runs even if the snake is wrapping
+                if (snake->cells[i].x != snake->cells[i + 1].x) {
+                  // Next Cell is to the Right
+                  SNAKE_CELL_LR(buffer, buffer);
+                } else {
+                  // Next Cell is on the vertical axis
+                  
+                  // Is the Next Cell Up or Down?
+                  if (snake->cells[i].y > snake->cells[i + 1].y) {
+                    if (snake->cells[i].y - 1 != snake->cells[i + 1].y) {
+                      // Wrapping has occurred.  Treat as opposite direction.
+                      goto render_middle_from_left_to_bottom;
+                    }
+                    // Next Cell is to the Top
+                    render_middle_from_left_to_top:
+                    SNAKE_CELL_TL(buffer, buffer);
+                  } else {
+                    if (snake->cells[i].y + 1 != snake->cells[i + 1].y) {
+                      // Wrapping has occurred.  Treat as opposite direction.
+                      goto render_middle_from_left_to_top;
+                    }
+                    // Next Cell is to the Bottom
+                    render_middle_from_left_to_bottom:
+                    SNAKE_CELL_BL(buffer, buffer);
+                  }
+                }
+              } else if (snake->cells[i].x < snake->cells[i - 1].x) {
+                if (snake->cells[i].x + 1 != snake->cells[i - 1].x) {
+                  // Wrapping has occurred.  Treat as opposite direction.
+                  goto render_middle_from_left;
+                }
+                // Previous Cell is to the Right
+                render_middle_from_right:
+                
+                // Which direction is the Next Cell?
+                // Use Not Equals to ensure that this still runs even if the snake is wrapping
+                if (snake->cells[i].x != snake->cells[i + 1].x) {
+                  // Next Cell is to the Left
+                  SNAKE_CELL_LR(buffer, buffer);
+                } else {
+                  // Next Cell is on the vertical axis
+                  
+                  // Is the Next Cell Up or Down?
+                  if (snake->cells[i].y > snake->cells[i + 1].y) {
+                    if (snake->cells[i].y - 1 != snake->cells[i + 1].y) {
+                      // Wrapping has occurred.  Treat as opposite direction.
+                      goto render_middle_from_right_to_bottom;
+                    }
+                    // Next Cell is to the Top
+                    render_middle_from_right_to_top:
+                    SNAKE_CELL_TR(buffer, buffer);
+                  } else {
+                    if (snake->cells[i].y + 1 != snake->cells[i + 1].y) {
+                      // Wrapping has occurred.  Treat as opposite direction.
+                      goto render_middle_from_right_to_top;
+                    }
+                    // Next Cell is to the Bottom
+                    render_middle_from_right_to_bottom:
+                    SNAKE_CELL_BR(buffer, buffer);
+                  }
+                }
+              } else {
+                // Previous Cell is on the vertical axis
+                
+                // Is the Previous Cell Up or Down?
+                if (snake->cells[i].y > snake->cells[i - 1].y) {
+                  if (snake->cells[i].y - 1 != snake->cells[i - 1].y) {
+                    // Wrapping has occurred.  Treat as opposite direction.
+                    goto render_middle_from_bottom;
+                  }
+                  // Previous Cell is to the Top
+                  render_middle_from_top:
+                  
+                  // Which direction is the Next Cell?
+                  if (snake->cells[i].x > snake->cells[i + 1].x) {
+                    if (snake->cells[i].x - 1 != snake->cells[i + 1].x) {
+                      // Wrapping has occurred.  Treat as opposite direction.
+                      goto render_middle_from_top_to_right;
+                    }
+                    // Next Cell is to the Left
+                    render_middle_from_top_to_left:
+                    SNAKE_CELL_TL(buffer, buffer);
+                  } else if (snake->cells[i].x < snake->cells[i + 1].x) {
+                    if (snake->cells[i].x + 1 != snake->cells[i + 1].x) {
+                      // Wrapping has occurred.  Treat as opposite direction.
+                      goto render_middle_from_top_to_left;
+                    }
+                    // Next Cell is to the Right
+                    render_middle_from_top_to_right:
+                    SNAKE_CELL_TR(buffer, buffer);
+                  } else {
+                    // Next Cell is to the Bottom
+                    SNAKE_CELL_TB(buffer, buffer);
+                  }
+                } else {
+                  if (snake->cells[i].y + 1 != snake->cells[i - 1].y) {
+                    // Wrapping has occurred.  Treat as opposite direction.
+                    goto render_middle_from_top;
+                  }
+                  // Previous Cell is to the Bottom
+                  render_middle_from_bottom:
+                  
+                  // Which direction is the Next Cell?
+                  if (snake->cells[i].x > snake->cells[i + 1].x) {
+                    if (snake->cells[i].x - 1 != snake->cells[i + 1].x) {
+                      // Wrapping has occurred.  Treat as opposite direction.
+                      goto render_middle_from_bottom_to_right;
+                    }
+                    // Next Cell is to the Left
+                    render_middle_from_bottom_to_left:
+                    SNAKE_CELL_BL(buffer, buffer);
+                  } else if (snake->cells[i].x < snake->cells[i + 1].x) {
+                    if (snake->cells[i].x + 1 != snake->cells[i + 1].x) {
+                      // Wrapping has occurred.  Treat as opposite direction.
+                      goto render_middle_from_bottom_to_left;
+                    }
+                    // Next Cell is to the Right
+                    render_middle_from_bottom_to_right:
+                    SNAKE_CELL_BR(buffer, buffer);
+                  } else {
+                    // Next Cell is to the Top
+                    SNAKE_CELL_TB(buffer, buffer);
+                  }
+                }
+              }
+            }
+          } else {
+            // UTF-8 not supported, fall back to ASCII for snake body
+            FALLBACK_SNAKE(buffer, buffer);
+          }
+          
           goto next_grid_cell;
         }
       }
@@ -296,8 +702,11 @@ void regen_buffer(char *buffer, struct Snake *snake, struct GridCell *food) {
       // Is this a Food Cell?
       if (food->x == (signed int)x && food->y == (signed int)y) {
         // Regen Food Cell
-        *buffer = 'x';
-        buffer++;
+        if (utf8_support) {
+          FOOD_CELL(buffer, buffer);
+        } else {
+          FALLBACK_FOOD_CELL(buffer, buffer);
+        }
         goto next_grid_cell;
       }
       
@@ -309,12 +718,12 @@ void regen_buffer(char *buffer, struct Snake *snake, struct GridCell *food) {
       next_grid_cell:;
     }
     
-    *buffer = 0xE2;
-    buffer++;
-    *buffer = 0x94;
-    buffer++;
-    *buffer = 0x83;
-    buffer++;
+    // Render a Vertical Element of the Right Grid Border
+    if (utf8_support) {
+      BORDER_VERTICAL(buffer, buffer);
+    } else {
+      FALLBACK_BORDER(buffer, buffer);
+    }
     
 #ifndef NOEXPLICITNEWLINES
     // In case we are running on a TTY that does not get up-to-date terminal size 
@@ -331,26 +740,18 @@ void regen_buffer(char *buffer, struct Snake *snake, struct GridCell *food) {
     
   }
   
-  *buffer = 0xE2;
-  buffer++;
-  *buffer = 0x94;
-  buffer++;
-  *buffer = 0x97;
-  buffer++;
-  for (unsigned int x = 0; x < grid_width; x++) {
-    *buffer = 0xE2;
-    buffer++;
-    *buffer = 0x94;
-    buffer++;
-    *buffer = 0x81;
-    buffer++;
+  // Render Bottom Grid Border
+  if (utf8_support) {
+    BORDER_CORNER_BOTTOMLEFT(buffer, buffer);
+    for (unsigned int x = 0; x < grid_width; x++) {
+      BORDER_HORIZONTAL(buffer, buffer);
+    }
+    BORDER_CORNER_BOTTOMRIGHT(buffer, buffer);
+  } else {
+    for (unsigned int x = 0; x < term_width; x++) {
+      FALLBACK_BORDER(buffer, buffer);
+    }
   }
-  *buffer = 0xE2;
-  buffer++;
-  *buffer = 0x94;
-  buffer++;
-  *buffer = 0x9B;
-  buffer++;
   
   // Make sure the string is NULL terminated
   *buffer = 0;
@@ -487,7 +888,7 @@ void* game_loop(void *thread_info) {
     sem_wai2(&sem0);
     snake_crawl(snake, food);
     regen_buffer(display_content, snake, food);
-    dprintf(STDOUT, "\e[%d;%dH%s", 1, 1, display_content);
+    dprintf(STDOUT, "\e[1;1H%s", display_content);
     sem_post(&sem0);
     
     // The rest of the loop below calculates sleep time and sleeps while 
@@ -742,8 +1143,8 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
         } else if (data == 'e' || data == 'E') {
           sem_wai2(&sem1);
           if (term_width == curr_term_width && term_height == curr_term_height) {
-            kill(0, USIG_PAUSE); // Dispatch Pause signal to Game Loop thread
             if (not_paused) {
+              kill(0, USIG_PAUSE); // Dispatch Pause signal to Game Loop thread (Pause)
               sigset_t wait_signal;
               sigemptyset(&wait_signal);
               sigaddset(&wait_signal, USIG_P_ACK);
@@ -763,8 +1164,10 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
               dprintf(STDOUT, "Current Score: %d\n\r", score);
               dprintf(STDOUT, "Expected terminal size for current game: %dx%d\n\r", term_width, term_height);
               dprintf(STDOUT, "Current terminal size: %dx%d\n\r", curr_term_width, curr_term_height);
-              dprintf(STDOUT, "The terminal size must match the expected size before unpause will be allowed.\n\r");
+              dprintf(STDOUT, "The terminal size must match the expected size before unpause will be allowed.\r");
             } else {
+              dprintf(STDOUT, "\e[1;1H%s", display_content);
+              kill(0, USIG_PAUSE); // Dispatch Pause signal to Game Loop thread (Resume)
               not_paused = 1;
             }
           }
@@ -777,11 +1180,27 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
               if (snake.direction == DIR_UP || snake.direction == DIR_LEFT || snake.direction == DIR_RIGHT) {
                 snake.new_direction = DIR_UP;
               }
+              // Regenerating and Redrawing the display is not necessary if UTF-8 is off because 
+              // the snake doesn't change with basic ASCII encoding in the event of altered 
+              // new_direction settings.  This will help with display performance if running 
+              // through an actual COM port, such as an RS232 or UART, with UTF-8 off.
+              if (utf8_support) {
+                regen_buffer(display_content, &snake, &food);
+                dprintf(STDOUT, "\e[1;1H%s", display_content);
+              }
               sem_post(&sem0);
             } else if (data == 's' || data == 'S') {
               sem_wai2(&sem0);
               if (snake.direction == DIR_DOWN || snake.direction == DIR_LEFT || snake.direction == DIR_RIGHT) {
                 snake.new_direction = DIR_DOWN;
+              }
+              // Regenerating and Redrawing the display is not necessary if UTF-8 is off because 
+              // the snake doesn't change with basic ASCII encoding in the event of altered 
+              // new_direction settings.  This will help with display performance if running 
+              // through an actual COM port, such as an RS232 or UART, with UTF-8 off.
+              if (utf8_support) {
+                regen_buffer(display_content, &snake, &food);
+                dprintf(STDOUT, "\e[1;1H%s", display_content);
               }
               sem_post(&sem0);
             } else if (data == 'a' || data == 'A') {
@@ -789,11 +1208,27 @@ signed int main(signed int argc, char *argv[], char *envp[]) {
               if (snake.direction == DIR_UP || snake.direction == DIR_LEFT || snake.direction == DIR_DOWN) {
                 snake.new_direction = DIR_LEFT;
               }
+              // Regenerating and Redrawing the display is not necessary if UTF-8 is off because 
+              // the snake doesn't change with basic ASCII encoding in the event of altered 
+              // new_direction settings.  This will help with display performance if running 
+              // through an actual COM port, such as an RS232 or UART, with UTF-8 off.
+              if (utf8_support) {
+                regen_buffer(display_content, &snake, &food);
+                dprintf(STDOUT, "\e[1;1H%s", display_content);
+              }
               sem_post(&sem0);
             } else if (data == 'd' || data == 'D') {
               sem_wai2(&sem0);
               if (snake.direction == DIR_UP || snake.direction == DIR_RIGHT || snake.direction == DIR_DOWN) {
                 snake.new_direction = DIR_RIGHT;
+              }
+              // Regenerating and Redrawing the display is not necessary if UTF-8 is off because 
+              // the snake doesn't change with basic ASCII encoding in the event of altered 
+              // new_direction settings.  This will help with display performance if running 
+              // through an actual COM port, such as an RS232 or UART, with UTF-8 off.
+              if (utf8_support) {
+                regen_buffer(display_content, &snake, &food);
+                dprintf(STDOUT, "\e[1;1H%s", display_content);
               }
               sem_post(&sem0);
             }
