@@ -241,6 +241,17 @@ struct ThreadInfo {
   char *display_content;
 };
 
+int sem_wai2(sem_t *sem);
+void signal_handle(signed int sig_number);
+signed int gen_random_number(signed int min, signed int max);
+void rand_food_location(struct GridCell *food, struct Snake *snake, unsigned int width, unsigned int height);
+void regen_buffer(char *buffer, struct Snake *snake, struct GridCell *food);
+void snake_append_cells(struct Snake *snake, unsigned int num_to_add);
+void snake_crawl(struct Snake *snake, struct GridCell *food);
+void* game_loop(void *thread_info);
+void* signal_receiver_thread(void *arg);
+signed int main(signed int argc, char *argv[], char *envp[]);
+
 int sem_wai2(sem_t *sem) {
   // Wrapper sem_wait() to force a retry in the event of failure code EINTR
   
