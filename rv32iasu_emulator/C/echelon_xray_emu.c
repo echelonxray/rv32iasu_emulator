@@ -4,7 +4,7 @@
  * 
  * Copyright: 
  * (C) Copyright 2022 Michael T. Kloos (http://www.michaelkloos.com/).
- * All Rights Reserved
+ * All Rights Reserved.
  */
 
 #include <fcntl.h>
@@ -1456,6 +1456,415 @@ uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
 			return ILLEGAL_INSTRUCTION;
 		}
 		
+	} else if (OPCODE(inst) == 0x2F) {
+		// Possible: LR.W, SC.W
+		// Possible: AMOSWAP.W, AMOADD.W, AMOXOR.W, AMOAND.W, AMOOR.W, AMOMIN.W, AMOMAX.W, AMOMINU.W, AMOMAXU.W
+		// R-type
+		
+		if (R_funct3(inst) == 0x2) {
+			// Possible: LR.W, SC.W
+			// Possible: AMOSWAP.W, AMOADD.W, AMOXOR.W, AMOAND.W, AMOOR.W, AMOMIN.W, AMOMAX.W, AMOMINU.W, AMOMAXU.W
+			
+			uint32_t funct7_prefix = R_funct7(inst) & 0x7C;
+			if        (funct7_prefix == 0x08) {
+				// Instruction: LR.W
+				
+				if (R_rs2(inst) != 0) {
+					// Invalid Op-code
+					return ILLEGAL_INSTRUCTION;
+				}
+				
+#ifdef DEBUG
+				dprintf(STDERR, "\tLR.W\n");
+#endif
+				
+				// TODO
+				
+			} else if (funct7_prefix == 0x0C) {
+				// Instruction: SC.W
+				
+#ifdef DEBUG
+				dprintf(STDERR, "\tSC.W\n");
+#endif
+				
+				// TODO
+				
+			} else if (funct7_prefix == 0x04) {
+				// Instruction: AMOSWAP.W
+				
+#ifdef DEBUG
+				dprintf(STDERR, "\tAMOSWAP.W\n");
+#endif
+				
+				uint32_t addr = RegVal[R_rs1(inst)];
+				struct retvals rtn;
+				rtn = ReadMemory(addr, 32, context);
+				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
+					if (rtn.error == LOAD_ADDRESS_MISALIGNED) {
+						return STORE_AMO_ADDRESS_MISALIGNED;
+					}
+					if (rtn.error == LOAD_PAGE_FAULT) {
+						return STORE_AMO_PAGE_FAULT;
+					}
+					if (rtn.error == LOAD_ACCESS_FAULT) {
+						return STORE_AMO_ACCESS_FAULT;
+					}
+					return rtn.error;
+				}
+				uint32_t rd;
+				uint32_t working;
+				rd = rtn.value;
+				working = rd;
+				
+				working  = RegVal[R_rs2(inst)];
+				
+				rtn = SaveMemory(addr, 32, context, working);
+				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
+					return rtn.error;
+				}
+				
+				if (R_rd(inst) != 0) {
+					RegVal[R_rd(inst)] = rd;
+				}
+				
+			} else if (funct7_prefix == 0x00) {
+				// Instruction: AMOADD.W
+				
+#ifdef DEBUG
+				dprintf(STDERR, "\tAMOADD.W\n");
+#endif
+				
+				uint32_t addr = RegVal[R_rs1(inst)];
+				struct retvals rtn;
+				rtn = ReadMemory(addr, 32, context);
+				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
+					if (rtn.error == LOAD_ADDRESS_MISALIGNED) {
+						return STORE_AMO_ADDRESS_MISALIGNED;
+					}
+					if (rtn.error == LOAD_PAGE_FAULT) {
+						return STORE_AMO_PAGE_FAULT;
+					}
+					if (rtn.error == LOAD_ACCESS_FAULT) {
+						return STORE_AMO_ACCESS_FAULT;
+					}
+					return rtn.error;
+				}
+				uint32_t rd;
+				uint32_t working;
+				rd = rtn.value;
+				working = rd;
+				
+				working += RegVal[R_rs2(inst)];
+				
+				rtn = SaveMemory(addr, 32, context, working);
+				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
+					return rtn.error;
+				}
+				
+				if (R_rd(inst) != 0) {
+					RegVal[R_rd(inst)] = rd;
+				}
+				
+			} else if (funct7_prefix == 0x10) {
+				// Instruction: AMOXOR.W
+				
+#ifdef DEBUG
+				dprintf(STDERR, "\tAMOXOR.W\n");
+#endif
+				
+				uint32_t addr = RegVal[R_rs1(inst)];
+				struct retvals rtn;
+				rtn = ReadMemory(addr, 32, context);
+				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
+					if (rtn.error == LOAD_ADDRESS_MISALIGNED) {
+						return STORE_AMO_ADDRESS_MISALIGNED;
+					}
+					if (rtn.error == LOAD_PAGE_FAULT) {
+						return STORE_AMO_PAGE_FAULT;
+					}
+					if (rtn.error == LOAD_ACCESS_FAULT) {
+						return STORE_AMO_ACCESS_FAULT;
+					}
+					return rtn.error;
+				}
+				uint32_t rd;
+				uint32_t working;
+				rd = rtn.value;
+				working = rd;
+				
+				working ^= RegVal[R_rs2(inst)];
+				
+				rtn = SaveMemory(addr, 32, context, working);
+				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
+					return rtn.error;
+				}
+				
+				if (R_rd(inst) != 0) {
+					RegVal[R_rd(inst)] = rd;
+				}
+				
+			} else if (funct7_prefix == 0x30) {
+				// Instruction: AMOAND.W
+				
+#ifdef DEBUG
+				dprintf(STDERR, "\tAMOAND.W\n");
+#endif
+				
+				uint32_t addr = RegVal[R_rs1(inst)];
+				struct retvals rtn;
+				rtn = ReadMemory(addr, 32, context);
+				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
+					if (rtn.error == LOAD_ADDRESS_MISALIGNED) {
+						return STORE_AMO_ADDRESS_MISALIGNED;
+					}
+					if (rtn.error == LOAD_PAGE_FAULT) {
+						return STORE_AMO_PAGE_FAULT;
+					}
+					if (rtn.error == LOAD_ACCESS_FAULT) {
+						return STORE_AMO_ACCESS_FAULT;
+					}
+					return rtn.error;
+				}
+				uint32_t rd;
+				uint32_t working;
+				rd = rtn.value;
+				working = rd;
+				
+				working &= RegVal[R_rs2(inst)];
+				
+				rtn = SaveMemory(addr, 32, context, working);
+				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
+					return rtn.error;
+				}
+				
+				if (R_rd(inst) != 0) {
+					RegVal[R_rd(inst)] = rd;
+				}
+				
+			} else if (funct7_prefix == 0x20) {
+				// Instruction: AMOOR.W
+				
+#ifdef DEBUG
+				dprintf(STDERR, "\tAMOOR.W\n");
+#endif
+				
+				uint32_t addr = RegVal[R_rs1(inst)];
+				struct retvals rtn;
+				rtn = ReadMemory(addr, 32, context);
+				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
+					if (rtn.error == LOAD_ADDRESS_MISALIGNED) {
+						return STORE_AMO_ADDRESS_MISALIGNED;
+					}
+					if (rtn.error == LOAD_PAGE_FAULT) {
+						return STORE_AMO_PAGE_FAULT;
+					}
+					if (rtn.error == LOAD_ACCESS_FAULT) {
+						return STORE_AMO_ACCESS_FAULT;
+					}
+					return rtn.error;
+				}
+				uint32_t rd;
+				uint32_t working;
+				rd = rtn.value;
+				working = rd;
+				
+				working |= RegVal[R_rs2(inst)];
+				
+				rtn = SaveMemory(addr, 32, context, working);
+				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
+					return rtn.error;
+				}
+				
+				if (R_rd(inst) != 0) {
+					RegVal[R_rd(inst)] = rd;
+				}
+				
+			} else if (funct7_prefix == 0x40) {
+				// Instruction: AMOMIN.W
+				
+#ifdef DEBUG
+				dprintf(STDERR, "\tAMOMIN.W\n");
+#endif
+				
+				uint32_t addr = RegVal[R_rs1(inst)];
+				struct retvals rtn;
+				rtn = ReadMemory(addr, 32, context);
+				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
+					if (rtn.error == LOAD_ADDRESS_MISALIGNED) {
+						return STORE_AMO_ADDRESS_MISALIGNED;
+					}
+					if (rtn.error == LOAD_PAGE_FAULT) {
+						return STORE_AMO_PAGE_FAULT;
+					}
+					if (rtn.error == LOAD_ACCESS_FAULT) {
+						return STORE_AMO_ACCESS_FAULT;
+					}
+					return rtn.error;
+				}
+				uint32_t rd;
+				uint32_t working;
+				rd = rtn.value;
+				working = rd;
+				
+				sint32_t v1 = working;
+				sint32_t v2 = RegVal[R_rs2(inst)];
+				if (v1 < v2) {
+					working = v1;
+				} else {
+					working = v2;
+				}
+				
+				rtn = SaveMemory(addr, 32, context, working);
+				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
+					return rtn.error;
+				}
+				
+				if (R_rd(inst) != 0) {
+					RegVal[R_rd(inst)] = rd;
+				}
+				
+			} else if (funct7_prefix == 0x50) {
+				// Instruction: AMOMAX.W
+				
+#ifdef DEBUG
+				dprintf(STDERR, "\tAMOMAX.W\n");
+#endif
+				
+				uint32_t addr = RegVal[R_rs1(inst)];
+				struct retvals rtn;
+				rtn = ReadMemory(addr, 32, context);
+				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
+					if (rtn.error == LOAD_ADDRESS_MISALIGNED) {
+						return STORE_AMO_ADDRESS_MISALIGNED;
+					}
+					if (rtn.error == LOAD_PAGE_FAULT) {
+						return STORE_AMO_PAGE_FAULT;
+					}
+					if (rtn.error == LOAD_ACCESS_FAULT) {
+						return STORE_AMO_ACCESS_FAULT;
+					}
+					return rtn.error;
+				}
+				uint32_t rd;
+				uint32_t working;
+				rd = rtn.value;
+				working = rd;
+				
+				sint32_t v1 = working;
+				sint32_t v2 = RegVal[R_rs2(inst)];
+				if (v1 > v2) {
+					working = v1;
+				} else {
+					working = v2;
+				}
+				
+				rtn = SaveMemory(addr, 32, context, working);
+				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
+					return rtn.error;
+				}
+				
+				if (R_rd(inst) != 0) {
+					RegVal[R_rd(inst)] = rd;
+				}
+				
+			} else if (funct7_prefix == 0x60) {
+				// Instruction: AMOMINU.W
+				
+#ifdef DEBUG
+				dprintf(STDERR, "\tAMOMINU.W\n");
+#endif
+				
+				uint32_t addr = RegVal[R_rs1(inst)];
+				struct retvals rtn;
+				rtn = ReadMemory(addr, 32, context);
+				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
+					if (rtn.error == LOAD_ADDRESS_MISALIGNED) {
+						return STORE_AMO_ADDRESS_MISALIGNED;
+					}
+					if (rtn.error == LOAD_PAGE_FAULT) {
+						return STORE_AMO_PAGE_FAULT;
+					}
+					if (rtn.error == LOAD_ACCESS_FAULT) {
+						return STORE_AMO_ACCESS_FAULT;
+					}
+					return rtn.error;
+				}
+				uint32_t rd;
+				uint32_t working;
+				rd = rtn.value;
+				working = rd;
+				
+				uint32_t v1 = working;
+				uint32_t v2 = RegVal[R_rs2(inst)];
+				if (v1 < v2) {
+					working = v1;
+				} else {
+					working = v2;
+				}
+				
+				rtn = SaveMemory(addr, 32, context, working);
+				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
+					return rtn.error;
+				}
+				
+				if (R_rd(inst) != 0) {
+					RegVal[R_rd(inst)] = rd;
+				}
+				
+			} else if (funct7_prefix == 0x70) {
+				// Instruction: AMOMAXU.W
+				
+#ifdef DEBUG
+				dprintf(STDERR, "\tAMOMAXU.W\n");
+#endif
+				
+				uint32_t addr = RegVal[R_rs1(inst)];
+				struct retvals rtn;
+				rtn = ReadMemory(addr, 32, context);
+				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
+					if (rtn.error == LOAD_ADDRESS_MISALIGNED) {
+						return STORE_AMO_ADDRESS_MISALIGNED;
+					}
+					if (rtn.error == LOAD_PAGE_FAULT) {
+						return STORE_AMO_PAGE_FAULT;
+					}
+					if (rtn.error == LOAD_ACCESS_FAULT) {
+						return STORE_AMO_ACCESS_FAULT;
+					}
+					return rtn.error;
+				}
+				uint32_t rd;
+				uint32_t working;
+				rd = rtn.value;
+				working = rd;
+				
+				uint32_t v1 = working;
+				uint32_t v2 = RegVal[R_rs2(inst)];
+				if (v1 > v2) {
+					working = v1;
+				} else {
+					working = v2;
+				}
+				
+				rtn = SaveMemory(addr, 32, context, working);
+				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
+					return rtn.error;
+				}
+				
+				if (R_rd(inst) != 0) {
+					RegVal[R_rd(inst)] = rd;
+				}
+				
+			} else {
+				// Invalid Op-code
+				return ILLEGAL_INSTRUCTION;
+			}
+			
+		} else {
+			// Invalid Op-code
+			return ILLEGAL_INSTRUCTION;
+		}
+		
 	} else if (OPCODE(inst) == 0x73) {
 		// Possible: ECALL, EBREAK
 		// Possible: CSRRW, CSRRS, CSRRC, CSRRWI, CSRRSI, CSRRCI
@@ -1501,52 +1910,56 @@ uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
 			} else if (I_imm(inst) == 1) {
 				// Instruction: EBREAK
 				
-#ifdef DEBUG
-				dprintf(STDERR, "\tEBREAK\n");
-#endif
-				
 				if (I_rs1(inst) != 0) {
 					// Invalid Op-code
 					return ILLEGAL_INSTRUCTION;
 				}
+				
+#ifdef DEBUG
+				dprintf(STDERR, "\tEBREAK\n");
+#endif
 				
 				return BREAKPOINT;
 				
 			} else if (I_imm(inst) == 0x102) {
 				// Instruction: SRET
 				
-#ifdef DEBUG
-				dprintf(STDERR, "\tSRET\n");
-#endif
-				
 				if (I_rs1(inst) != 0) {
 					// Invalid Op-code
 					return ILLEGAL_INSTRUCTION;
 				}
 				
+#ifdef DEBUG
+				dprintf(STDERR, "\tSRET\n");
+#endif
+				
+				// TODO
+				
 			} else if (I_imm(inst) == 0x302) {
 				// Instruction: MRET
+				
+				if (I_rs1(inst) != 0) {
+					// Invalid Op-code
+					return ILLEGAL_INSTRUCTION;
+				}
 				
 #ifdef DEBUG
 				dprintf(STDERR, "\tMRET\n");
 #endif
 				
-				if (I_rs1(inst) != 0) {
-					// Invalid Op-code
-					return ILLEGAL_INSTRUCTION;
-				}
+				// TODO
 				
 			} else if (I_imm(inst) == 0x105) {
 				// Instruction: WFI
 				
-#ifdef DEBUG
-				dprintf(STDERR, "\tWFI\n");
-#endif
-				
 				if (I_rs1(inst) != 0) {
 					// Invalid Op-code
 					return ILLEGAL_INSTRUCTION;
 				}
+				
+#ifdef DEBUG
+				dprintf(STDERR, "\tWFI\n");
+#endif
 				
 				context->pc += 4;
 				return CUSTOM_INTERNAL_WFI_SLEEP;
@@ -1780,8 +2193,14 @@ signed int main(unsigned int argc, char *argv[], char *envp[]) {
 	if (statbuf.st_size == 0) {
 		return 10;
 	}
-	mmdata = malloc(statbuf.st_size);
-	ret_val = read(fd, memory, statbuf.st_size);
+	off_t fsize = statbuf.st_size;
+	if (fsize & 0x3) {
+		fsize &= ~((off_t)0x3);
+		fsize += 0x4;
+	}
+	mmdata_length = fsize;
+	mmdata = malloc(fsize);
+	ret_val = read(fd, mmdata, statbuf.st_size);
 	close(fd);
 	if (ret_val != statbuf.st_size) {
 		free(mmdata);
