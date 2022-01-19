@@ -16,6 +16,10 @@
 #include <time.h>
 #include <unistd.h>
 
+//#define DEBUG
+//#define DEBUG_Trap
+//#define DEBUG1
+
 typedef int32_t sint32_t;
 
 #define OPCODE(value) (value & 0x7F)
@@ -57,8 +61,6 @@ typedef int32_t sint32_t;
 #define STDIN  0
 #define STDOUT 1
 #define STDERR 2
-
-//#define DEBUG
 
 // Exception Causes
 #define INSTRUCTION_ADDRESS_MISALIGNED     0
@@ -125,6 +127,7 @@ struct cpu_context {
 	uint32_t xr[32];
 	uint32_t pc;
 	uint32_t mode;
+	uint32_t lr_reserve_set;
 	uint32_t csr[20];
 };
 
@@ -140,6 +143,11 @@ void* mmdata; // 0x2000_0000
 void* memory; // 0x8000_0000
 
 uint32_t mmdata_length; // Should be in 4 byte increments
+/*
+uint32_t tlb_virt;
+uint32_t tlb_phys;
+uint32_t tlb_perm;
+*/
 
 // PLIC Regs
 uint32_t plic_source_priorities; //       Offset 0x0000_0000
@@ -154,6 +162,10 @@ uint32_t plic_h0_s_claim_compl;
 // CLINT Regs
 uint32_t clint_mtimecmp;
 uint32_t clint_mtimecmph;
+// Internal
+uint32_t clint_time;
+uint32_t clint_timeh;
+struct timespec clint_start_time;
 
 // UART0 Regs
 uint32_t uart0_txdata;
@@ -167,7 +179,25 @@ uint32_t uart0_div;
 uint32_t uart0_rxcue;
 uint32_t uart0_rxcuecount;
 
-uint32_t ReadPhysMemory(uint32_t addr, unsigned int bitwidth, struct cpu_context *context) {
+int debug;
+
+void print_reg_state(struct cpu_context *context) {
+	dprintf(STDOUT, "----Print Reg State----\n");
+	dprintf(STDOUT, "\tPC: 0x%08X\n", context->pc);
+	dprintf(STDOUT, "\tMode: %d\n", context->mode);
+	for (int i = 0; i < 32; i += 2) {
+		dprintf(STDOUT, "\tx%02d: 0x%08X, x%02d: 0x%08X\n", i, context->xr[i], i + 1, context->xr[i + 1]);
+	}
+}
+
+static inline uint32_t ReadPhysMemory(uint32_t addr, unsigned int bitwidth, struct cpu_context *context) {
+#ifdef DEBUG1
+	if (addr == 0x80004f74) {
+		uint32_t* ptr = memory + (addr - 0x80000000);
+		dprintf(STDERR, "read value: %d\n", *ptr);
+	}
+#endif
+	
 	if        (addr >= 0x80000000 && addr < 0x88000000) {
 		addr -= 0x80000000;
 		if        (bitwidth == 32) {
@@ -256,7 +286,13 @@ uint32_t ReadPhysMemory(uint32_t addr, unsigned int bitwidth, struct cpu_context
 	return 0;
 }
 
-void SavePhysMemory(uint32_t addr, unsigned int bitwidth, struct cpu_context *context, uint32_t value) {
+static inline void SavePhysMemory(uint32_t addr, unsigned int bitwidth, struct cpu_context *context, uint32_t value) {
+#ifdef DEBUG1
+	if (addr == 0x80004f74) {
+		dprintf(STDERR, "save value: %d\n", value);
+	}
+#endif
+	
 	if        (addr >= 0x80000000 && addr < 0x88000000) {
 		addr -= 0x80000000;
 		if        (bitwidth == 32) {
@@ -345,7 +381,7 @@ void SavePhysMemory(uint32_t addr, unsigned int bitwidth, struct cpu_context *co
 	return;
 }
 
-struct retvals WalkPTs(uint32_t location, uint32_t csr_satp, uint32_t access_type, struct cpu_context *context) {
+static inline struct retvals WalkPTs(uint32_t location, uint32_t csr_satp, uint32_t access_type, struct cpu_context *context) {
 	uint32_t mem_addr;
 	
 	// Get the inital value of the satp CSR
@@ -353,6 +389,16 @@ struct retvals WalkPTs(uint32_t location, uint32_t csr_satp, uint32_t access_typ
 	
 	// Is Virtual Memory Active?
 	if (page_walk < 0) {
+		/*
+		{
+			uint32 tmploc = location & 0xFFFFF000;
+			tlb_perm
+			if (tlb_virt == tmploc) {
+				return tmploc | tlb_phys;
+			}
+		}
+		*/
+		
 		// Shift to match PTE entry offset to ready for entry to the PT Walk loop
 		page_walk <<= 10;
 		
@@ -522,7 +568,7 @@ struct retvals WalkPTs(uint32_t location, uint32_t csr_satp, uint32_t access_typ
 	return rtn;
 }
 
-struct retvals ExecMemory(uint32_t addr, struct cpu_context *context) {
+static inline struct retvals ExecMemory(uint32_t addr, struct cpu_context *context) {
 	if (addr & 0x3) {
 		struct retvals rtn;
 		rtn.error = INSTRUCTION_ADDRESS_MISALIGNED;
@@ -549,7 +595,7 @@ struct retvals ExecMemory(uint32_t addr, struct cpu_context *context) {
 	return rtn;
 }
 
-struct retvals ReadMemory(uint32_t addr, unsigned int bitwidth, struct cpu_context *context) {
+static inline struct retvals ReadMemory(uint32_t addr, unsigned int bitwidth, struct cpu_context *context) {
 	if        (bitwidth == 32) {
 		if (addr & 0x3) {
 			struct retvals rtn;
@@ -585,7 +631,7 @@ struct retvals ReadMemory(uint32_t addr, unsigned int bitwidth, struct cpu_conte
 	return rtn;
 }
 
-struct retvals SaveMemory(uint32_t addr, unsigned int bitwidth, struct cpu_context *context, uint32_t value) {
+static inline struct retvals SaveMemory(uint32_t addr, unsigned int bitwidth, struct cpu_context *context, uint32_t value) {
 	if        (bitwidth == 32) {
 		if (addr & 0x3) {
 			struct retvals rtn;
@@ -613,6 +659,10 @@ struct retvals SaveMemory(uint32_t addr, unsigned int bitwidth, struct cpu_conte
 		addr = rtn.value;
 	}
 	
+	if (context->lr_reserve_set == (addr & ~((uint32_t)0x3))) {
+		context->lr_reserve_set = (sint32_t)-1;
+	}
+	
 	SavePhysMemory(addr, bitwidth, context, value);
 	
 	struct retvals rtn;
@@ -621,7 +671,7 @@ struct retvals SaveMemory(uint32_t addr, unsigned int bitwidth, struct cpu_conte
 	return rtn;
 }
 
-struct retvals CSR_Read(uint32_t csr_addr, struct cpu_context* context, uint32_t perm) {
+static inline struct retvals CSR_Read(uint32_t csr_addr, struct cpu_context* context, uint32_t perm) {
 	uint32_t csr_prefix = csr_addr & 0xF00;
 	
 	if        (csr_prefix == 0xF00) {
@@ -711,9 +761,9 @@ struct retvals CSR_Read(uint32_t csr_addr, struct cpu_context* context, uint32_t
 	} else if (csr_addr == 0x180) {
 		rtn.value = context->csr[CSR_SATP];
 	} else if (csr_addr == 0xC01) {
-		rtn.value = 0; // TODO - TIME
-	} else if (csr_addr == 0xC02) {
-		rtn.value = 0; // TODO - TIMEH
+		rtn.value = clint_time;
+	} else if (csr_addr == 0xC81) {
+		rtn.value = clint_timeh;
 	} else {
 		// CSR Does Not Exist
 		rtn.error = 1;
@@ -723,7 +773,7 @@ struct retvals CSR_Read(uint32_t csr_addr, struct cpu_context* context, uint32_t
 	return rtn;
 }
 
-void CSR_Write(uint32_t csr_addr, struct cpu_context* context, uint32_t value) {
+static inline void CSR_Write(uint32_t csr_addr, struct cpu_context* context, uint32_t value) {
 	// This function doesn't check for errors.  It will always 
 	// try to preform the requested action and may result in 
 	// unexpected and incorrect behaviour if an error should 
@@ -774,11 +824,11 @@ void CSR_Write(uint32_t csr_addr, struct cpu_context* context, uint32_t value) {
 	return;
 }
 
-uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
+static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
 	// Execute Instruction
 	
 #ifdef DEBUG
-	dprintf(STDERR, "PC: 0x%08X, DATA: 0x%08X, OPCODE: 0x%08X\n", context.pc, inst, OPCODE(inst));
+	dprintf(STDERR, "PC: 0x%08X, DATA: 0x%08X, OPCODE: 0x%08X\n", context->pc, inst, OPCODE(inst));
 #endif
 	
 	if (OPCODE(inst) == 0x37) {
@@ -797,6 +847,7 @@ uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
 #ifdef DEBUG
 		dprintf(STDERR, "\tAUIPC x%d, 0x%08X\n", U_rd(inst), U_imm(inst));
 #endif
+		//dprintf(STDERR, "\tAUIPC x%d, 0x%08X, [0x%08X]\n", U_rd(inst), U_imm(inst), context->pc);
 		
 		if (U_rd(inst) != 0) {
 			RegVal[U_rd(inst)] = U_imm(inst) + context->pc;
@@ -879,7 +930,7 @@ uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
 #endif
 			
 			uint32_t rs1b = RegVal[B_rs1(inst)];
-			uint32_t rs2b = RegVal[B_rs1(inst)];
+			uint32_t rs2b = RegVal[B_rs2(inst)];
 			if (rs1b == rs2b) {
 				take_branch = 1;
 			}
@@ -892,7 +943,7 @@ uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
 #endif
 			
 			uint32_t rs1b = RegVal[B_rs1(inst)];
-			uint32_t rs2b = RegVal[B_rs1(inst)];
+			uint32_t rs2b = RegVal[B_rs2(inst)];
 			if (rs1b != rs2b) {
 				take_branch = 1;
 			}
@@ -905,7 +956,7 @@ uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
 #endif
 			
 			sint32_t rs1b = RegVal[B_rs1(inst)];
-			sint32_t rs2b = RegVal[B_rs1(inst)];
+			sint32_t rs2b = RegVal[B_rs2(inst)];
 			if (rs1b < rs2b) {
 				take_branch = 1;
 			}
@@ -918,7 +969,7 @@ uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
 #endif
 			
 			sint32_t rs1b = RegVal[B_rs1(inst)];
-			sint32_t rs2b = RegVal[B_rs1(inst)];
+			sint32_t rs2b = RegVal[B_rs2(inst)];
 			if (rs1b >= rs2b) {
 				take_branch = 1;
 			}
@@ -931,7 +982,7 @@ uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
 #endif
 			
 			uint32_t rs1b = RegVal[B_rs1(inst)];
-			uint32_t rs2b = RegVal[B_rs1(inst)];
+			uint32_t rs2b = RegVal[B_rs2(inst)];
 			if (rs1b < rs2b) {
 				take_branch = 1;
 			}
@@ -939,12 +990,22 @@ uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
 		} else if (B_funct3(inst) == 0x7) {
 			// Instruction: BGEU
 			
-#ifdef DEBUG
+#ifdef DEBUG1
 			dprintf(STDERR, "\tBGEU x%d, x%d, 0x%08X\n", B_rs1(inst), B_rs2(inst), B_imm(inst));
 #endif
 			
 			uint32_t rs1b = RegVal[B_rs1(inst)];
-			uint32_t rs2b = RegVal[B_rs1(inst)];
+			uint32_t rs2b = RegVal[B_rs2(inst)];
+			
+#ifdef DEBUG1
+			dprintf(STDERR, "\trs1b: %d, rs2b: %d, Value: ", rs1b, rs2b);
+			if (rs1b >= rs2b) {
+				dprintf(STDERR, "%d\n", 1);
+			} else {
+				dprintf(STDERR, "%d\n", 0);
+			}
+#endif
+			
 			if (rs1b >= rs2b) {
 				take_branch = 1;
 			}
@@ -1024,7 +1085,7 @@ uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
 				rd |= 0xFFFF0000;
 			}
 			
-		} else if ((I_funct3(inst) & 0x3) == 0x2) {
+		} else if (I_funct3(inst) == 0x2) {
 			// Instruction: LW
 			
 #ifdef DEBUG
@@ -1042,6 +1103,12 @@ uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
 			// Invalid Op-code
 			return ILLEGAL_INSTRUCTION;
 		}
+		
+#ifdef DEBUG1
+		if (offset == 0x80004f74) {
+			dprintf(STDERR, "\tLX offset: 0x%X, rd: %d, I_rd(inst): %d\n", offset, rd, I_rd(inst));
+		}
+#endif
 		
 		if (I_rd(inst) != 0) {
 			RegVal[I_rd(inst)] = rd;
@@ -1439,14 +1506,23 @@ uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
 		}
 		
 	} else if (OPCODE(inst) == 0x0F) {
-		// Possible: FENCE
+		// Possible: FENCE, FENCE.I
 		// I-type
 		
-		if (I_funct3(inst) == 0x0) {
+		if        (I_funct3(inst) == 0x0) {
 			// Instruction: FENCE
 			
 #ifdef DEBUG
 			dprintf(STDERR, "\tFENCE\n");
+#endif
+			
+			// Do nothing, implemented as a NO-OP
+			
+		} else if (I_funct3(inst) == 0x1) {
+			// Instruction: FENCE.I
+			
+#ifdef DEBUG
+			dprintf(STDERR, "\tFENCE.I\n");
 #endif
 			
 			// Do nothing, implemented as a NO-OP
@@ -1478,7 +1554,28 @@ uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
 				dprintf(STDERR, "\tLR.W\n");
 #endif
 				
-				// TODO
+				uint32_t addr = RegVal[R_rs1(inst)];
+				
+				if (addr & 0x3) {
+					return LOAD_ADDRESS_MISALIGNED;
+				}
+				
+				if (context->mode < 3) {
+					struct retvals rtn;
+					rtn = WalkPTs(addr, context->csr[CSR_SATP], 0, context);
+					if (rtn.error) {
+						return LOAD_PAGE_FAULT;
+					}
+					addr = rtn.value;
+				}
+				
+				context->lr_reserve_set = addr;
+				uint32_t rd;
+				rd = ReadPhysMemory(addr, 32, context);
+				
+				if (R_rd(inst) != 0) {
+					RegVal[R_rd(inst)] = rd;
+				}
 				
 			} else if (funct7_prefix == 0x0C) {
 				// Instruction: SC.W
@@ -1487,7 +1584,34 @@ uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
 				dprintf(STDERR, "\tSC.W\n");
 #endif
 				
-				// TODO
+				uint32_t addr = RegVal[R_rs1(inst)];
+				uint32_t rs2b = RegVal[R_rs2(inst)];
+				
+				if (addr & 0x3) {
+					return LOAD_ADDRESS_MISALIGNED;
+				}
+				
+				if (context->mode < 3) {
+					struct retvals rtn;
+					rtn = WalkPTs(addr, context->csr[CSR_SATP], 0, context);
+					if (rtn.error) {
+						return STORE_AMO_PAGE_FAULT;
+					}
+					addr = rtn.value;
+				}
+				
+				uint32_t rd;
+				if (context->lr_reserve_set == addr) {
+					SavePhysMemory(addr, 32, context, rs2b);
+					rd = 0;
+				} else {
+					rd = 1;
+				}
+				context->lr_reserve_set = (sint32_t)-1;
+				
+				if (R_rd(inst) != 0) {
+					RegVal[R_rd(inst)] = rd;
+				}
 				
 			} else if (funct7_prefix == 0x04) {
 				// Instruction: AMOSWAP.W
@@ -1902,7 +2026,7 @@ uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
 				} else if (context->mode == 1) {
 					// S-Mode
 					return ENVIRONMENT_CALL_FROM_S_MODE;
-				} else {// context.mode == 3
+				} else {// context->mode == 3
 					// M-Mode
 					return ENVIRONMENT_CALL_FROM_M_MODE;
 				}
@@ -1924,30 +2048,51 @@ uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
 			} else if (I_imm(inst) == 0x102) {
 				// Instruction: SRET
 				
-				if (I_rs1(inst) != 0) {
+				if (I_rs1(inst) != 0 || context->mode < 0x1) {
 					// Invalid Op-code
 					return ILLEGAL_INSTRUCTION;
 				}
 				
-#ifdef DEBUG
-				dprintf(STDERR, "\tSRET\n");
+#if defined(DEBUG) || defined(DEBUG_Trap)
+				dprintf(STDERR, "\tSRET to: 0x%08X\n", context->csr[CSR_SEPC]);
 #endif
 				
-				// TODO
+				uint32_t bits_pp  = (context->csr[CSR_MSTATUS] >> 8) & 0x1;
+				uint32_t bits_pie = (context->csr[CSR_MSTATUS] >> 5) & 0x1;
+				context->csr[CSR_MSTATUS] &= 0xFFFFFEDD;
+				context->csr[CSR_MSTATUS] |= bits_pie << 1;
+				context->csr[CSR_MSTATUS] |= 1 << 5;
+				context->mode = bits_pp;
+				context->pc = context->csr[CSR_SEPC];
+				context->lr_reserve_set = (sint32_t)-1;
+				return CUSTOM_INTERNAL_EXECUTION_SUCCESS;
 				
 			} else if (I_imm(inst) == 0x302) {
 				// Instruction: MRET
 				
-				if (I_rs1(inst) != 0) {
+				if (I_rs1(inst) != 0 || context->mode < 0x3) {
 					// Invalid Op-code
 					return ILLEGAL_INSTRUCTION;
 				}
 				
-#ifdef DEBUG
-				dprintf(STDERR, "\tMRET\n");
+				uint32_t bits_pp  = (context->csr[CSR_MSTATUS] >> 11) & 0x3;
+				uint32_t bits_pie = (context->csr[CSR_MSTATUS] >>  7) & 0x1;
+				if (bits_pp == 2) {
+					// Invalid Execution Mode
+					return ILLEGAL_INSTRUCTION;
+				}
+				
+#if defined(DEBUG) || defined(DEBUG_Trap)
+				dprintf(STDERR, "\tMRET to: 0x%08X with mode: %d\n", context->csr[CSR_MEPC], bits_pp);
 #endif
 				
-				// TODO
+				context->csr[CSR_MSTATUS] &= 0xFFFFE777;
+				context->csr[CSR_MSTATUS] |= bits_pie << 3;
+				context->csr[CSR_MSTATUS] |= 1 << 7;
+				context->mode = bits_pp;
+				context->pc = context->csr[CSR_MEPC];
+				context->lr_reserve_set = (sint32_t)-1;
+				return CUSTOM_INTERNAL_EXECUTION_SUCCESS;
 				
 			} else if (I_imm(inst) == 0x105) {
 				// Instruction: WFI
@@ -1980,6 +2125,10 @@ uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
 		} else if (I_funct3(inst) == 0x1) {
 				// Instruction: CSRRW
 				
+#ifdef DEBUG
+				dprintf(STDERR, "\tCSRRW x%d, 0x%03X, x%d\n", I_rd(inst), I_imm(inst), I_rs1(inst));
+#endif
+				
 				uint32_t rs1b = RegVal[I_rs1(inst)];
 				struct retvals rtn = CSR_Read(I_imm(inst), context, 1);
 				if (rtn.error) {
@@ -1994,6 +2143,10 @@ uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
 		} else if (I_funct3(inst) == 0x2) {
 				// Instruction: CSRRS
 				
+#ifdef DEBUG
+				dprintf(STDERR, "\tCSRRS x%d, 0x%03X, x%d\n", I_rd(inst), I_imm(inst), I_rs1(inst));
+#endif
+				
 				uint32_t rs1b = RegVal[I_rs1(inst)];
 				uint32_t perm;
 				if (rs1b != 0) {
@@ -2009,11 +2162,17 @@ uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
 				if (I_rd(inst) != 0) {
 					RegVal[I_rd(inst)] = rtn.value;
 				}
-				CSR_Write(I_imm(inst), context, rs1b | rtn.value);
+				if (perm) {
+					CSR_Write(I_imm(inst), context, rs1b | rtn.value);
+				}
 				
 		} else if (I_funct3(inst) == 0x3) {
 				// Instruction: CSRRC
 				
+#ifdef DEBUG
+				dprintf(STDERR, "\tCSRRC x%d, 0x%03X, x%d\n", I_rd(inst), I_imm(inst), I_rs1(inst));
+#endif
+				
 				uint32_t rs1b = RegVal[I_rs1(inst)];
 				uint32_t perm;
 				if (rs1b != 0) {
@@ -2029,10 +2188,16 @@ uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
 				if (I_rd(inst) != 0) {
 					RegVal[I_rd(inst)] = rtn.value;
 				}
-				CSR_Write(I_imm(inst), context, rs1b & ~(rtn.value));
+				if (perm) {
+					CSR_Write(I_imm(inst), context, ~rs1b & rtn.value);
+				}
 				
 		} else if (I_funct3(inst) == 0x5) {
 				// Instruction: CSRRWI
+				
+#ifdef DEBUG
+				dprintf(STDERR, "\tCSRRWI x%d, 0x%03X, 0x%X\n", I_rd(inst), I_imm(inst), I_rs1(inst));
+#endif
 				
 				uint32_t rs1b = I_rs1(inst);
 				struct retvals rtn = CSR_Read(I_imm(inst), context, 1);
@@ -2048,6 +2213,10 @@ uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
 		} else if (I_funct3(inst) == 0x6) {
 				// Instruction: CSRRSI
 				
+#ifdef DEBUG
+				dprintf(STDERR, "\tCSRRSI x%d, 0x%03X, 0x%X\n", I_rd(inst), I_imm(inst), I_rs1(inst));
+#endif
+				
 				uint32_t rs1b = I_rs1(inst);
 				uint32_t perm;
 				if (rs1b != 0) {
@@ -2063,11 +2232,17 @@ uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
 				if (I_rd(inst) != 0) {
 					RegVal[I_rd(inst)] = rtn.value;
 				}
-				CSR_Write(I_imm(inst), context, rs1b | rtn.value);
+				if (perm) {
+					CSR_Write(I_imm(inst), context, rs1b | rtn.value);
+				}
 				
 		} else if (I_funct3(inst) == 0x7) {
 				// Instruction: CSRRCI
 				
+#ifdef DEBUG
+				dprintf(STDERR, "\tCSRRCI x%d, 0x%03X, 0x%X\n", I_rd(inst), I_imm(inst), I_rs1(inst));
+#endif
+				
 				uint32_t rs1b = I_rs1(inst);
 				uint32_t perm;
 				if (rs1b != 0) {
@@ -2083,7 +2258,9 @@ uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
 				if (I_rd(inst) != 0) {
 					RegVal[I_rd(inst)] = rtn.value;
 				}
-				CSR_Write(I_imm(inst), context, rs1b & ~(rtn.value));
+				if (perm) {
+					CSR_Write(I_imm(inst), context, ~rs1b & rtn.value);
+				}
 				
 		} else {
 			// Invalid Op-code
@@ -2099,15 +2276,307 @@ uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
 	return CUSTOM_INTERNAL_EXECUTION_SUCCESS;
 }
 
-void RunLoop(struct cpu_context* context) {
-	for (unsigned int i = 0; i < 200000; i++) {
+static inline void UpdateTimer(struct cpu_context* context) {
+	struct timespec curr_time;
+	clock_gettime(CLOCK_REALTIME, &curr_time);
+	
+	time_t tv_sec  = clint_start_time.tv_sec  - curr_time.tv_sec;
+	long   tv_nsec;
+	if (clint_start_time.tv_nsec < curr_time.tv_nsec) {
+		tv_nsec = curr_time.tv_nsec - clint_start_time.tv_nsec;
+		tv_nsec = 1000000000 - tv_nsec;
+		tv_sec--;
+	} else {
+		tv_nsec = clint_start_time.tv_nsec - curr_time.tv_nsec;
 	}
+	
+	uint64_t up_time_ms;
+	up_time_ms  = tv_sec;
+	up_time_ms *= 1000;
+	up_time_ms += tv_nsec / 1000000;
+	
+	clint_time  = (uint32_t)((up_time_ms >>  0) & 0xFFFFFFFF);
+	clint_timeh = (uint32_t)((up_time_ms >> 32) & 0xFFFFFFFF);
+	
+	uint64_t cmp_time_ms;
+	cmp_time_ms   = clint_mtimecmph;
+	cmp_time_ms <<= 32;
+	cmp_time_ms  |= clint_mtimecmp;
+	
+	if (cmp_time_ms <= up_time_ms) { // TODO: Double-Check if '<=' or '<' in RISC-V specs
+		// Set timer interrupt
+		context->csr[CSR_MIP] |=  ((uint32_t)0x080);
+	} else {
+		// Clear timer interrupt
+		context->csr[CSR_MIP] &= ~((uint32_t)0x080);
+	}
+	
+	return;
+}
+
+static inline void UpdateUART() {
+	uart0_ip = 0;
+	uint32_t rx_thres = (uart0_rxctrl >> 16) & 0x7;
+	if (uart0_rxcuecount > rx_thres) {
+		uart0_ip |=  ((uint32_t)(1 << 1));
+	} else {
+		uart0_ip &= ~((uint32_t)(1 << 1));
+	}
+	// It is not possible for the TX FIFO to fill in the emulated HW.
+	// Therefore, don't bother with it.
+	return;
+}
+
+static inline void UpdatePLIC(struct cpu_context* context) {
+	// Update Peripherals
+	UpdateUART();
+	
+	// Update Pending Array from Peripherals
+	if (uart0_ip & uart0_ie) {
+		// Wired to Interrupt <1>
+		plic_pending_array |= (1 << 1);
+	}
+	
+	// Update mip.MEIP and mip.SEIP Bit Flags
+	context->csr[CSR_MIP] &= ~(1 << 11);
+	context->csr[CSR_MIP] &= ~(1 << 9);
+	if (plic_pending_array & (1 << 1)) {
+		uint32_t priorty = plic_source_priorities;
+		if (plic_h0_m_pri_thres < priorty) {
+			if (plic_h0_m_inter_en & (1 << 1)) {
+				context->csr[CSR_MIP] |= (1 << 11);
+			}
+		}
+		if (plic_h0_s_pri_thres < priorty) {
+			if (plic_h0_s_inter_en & (1 << 1)) {
+				context->csr[CSR_MIP] |= (1 << 9);
+			}
+		}
+	}
+	
+	// Update Claim Registers
+	plic_h0_m_claim_compl = 0;
+	plic_h0_s_claim_compl = 0;
+	if (plic_pending_array & (1 << 1)) {
+		if (plic_h0_m_inter_en & (1 << 1)) {
+			plic_h0_m_claim_compl = 1;
+		}
+		if (plic_h0_s_inter_en & (1 << 1)) {
+			plic_h0_s_claim_compl = 1;
+		}
+	}
+	return;
+}
+
+static inline void TakeTrap(uint32_t exec_mode, uint32_t cause, uint32_t is_interrupt, struct cpu_context* context) {
+#ifdef DEBUG_Trap
+	dprintf(STDERR, "[Trap] pc: 0x%X\n", context->pc);
+#endif
+	
+	//console.log("[Trap]");
+	//console.log(memory);
+	//console.log("last_pc: 0x" + uitoa16(last_pc));
+	//console.log("last_p2: 0x" + uitoa16(last_p2));
+	//console.log("mepc: 0x" + uitoa16(mepc));
+	//print_reg_state();
+	//throw new Error(); // Debug
+	uint32_t xtvec;
+	uint32_t ncause = cause;
+	if (is_interrupt) {
+		ncause |= 0x80000000;
+	} else {
+		cause = 0;
+	}
+	if (exec_mode == 3) {
+		// New mode: M-Mode
+		xtvec = context->csr[CSR_MTVEC];
+		context->csr[CSR_MEPC] = context->pc;
+		context->csr[CSR_MCAUSE] = ncause;
+		context->csr[CSR_MTVAL] = 0; // TODO
+		uint32_t nstatus;
+		nstatus  =  context->csr[CSR_MSTATUS] & 0xFFFFE777;
+		nstatus |= (context->mode & 0x3) << 11;
+		nstatus |= (context->csr[CSR_MSTATUS] & 0x8) << 4;
+		context->csr[CSR_MSTATUS] = nstatus;
+	} else {
+		// New mode: S-Mode
+		xtvec = context->csr[CSR_STVEC];
+		context->csr[CSR_SEPC] = context->pc;
+		context->csr[CSR_SCAUSE] = ncause;
+		context->csr[CSR_STVAL] = 0; // TODO
+		uint32_t nstatus;
+		nstatus  =  context->csr[CSR_MSTATUS] & 0xFFFFFE22;
+		nstatus |= (context->mode & 0x1) << 8;
+		nstatus |= (context->csr[CSR_MSTATUS] & 0x2) << 4;
+		context->csr[CSR_MSTATUS] = nstatus;
+	}
+	if (xtvec & 0x1) {
+		context->pc = (xtvec & 0xFFFFFFFC) + (cause * 4);
+	} else {
+		context->pc =  xtvec & 0xFFFFFFFC;
+	}
+	context->mode = exec_mode;
+	context->lr_reserve_set = (sint32_t)-1;
+	return;
+}
+
+int RunLoop(struct cpu_context* context) {
+	struct pollfd pfd;
+	pfd.fd = STDIN;
+	pfd.events = POLLIN;
+	
+	for (unsigned int i = 0; i < 200000; i++) {
+		
+		signed int retval = poll(&pfd, 1, 0);
+		if (retval > 0 && pfd.revents & POLLIN) {
+			unsigned char buf;
+			retval = read(STDIN, &buf, 1);
+			if (retval > 0) {
+				if        (buf == 'a') {
+					debug = 1;
+				} else if (buf == 's') {
+					debug = 0;
+				} else if (buf == 'd') {
+					return 0;
+				}
+			}
+		}
+		
+		// Check for interrupts
+		// Update external interrupts
+		UpdatePLIC(context);
+		// Update timer interrupts
+		UpdateTimer(context);
+		
+		// Fire interrupts
+		{
+			uint32_t exec_mode = context->mode;
+			uint32_t csr_mip = context->csr[CSR_MIP];
+			uint32_t csr_mie = context->csr[CSR_MIE];
+			uint32_t csr_mideleg = context->csr[CSR_MIDELEG];
+			uint32_t csr_mstatus = context->csr[CSR_MSTATUS];
+			if        (exec_mode == 0) {
+				// U-Mode
+				if        (csr_mip & csr_mie & 0x800) {
+					// External M-Mode Interrupt
+					TakeTrap(3, 11, 1, context);
+				} else if (csr_mip & csr_mie & 0x008) {
+					// Software M-Mode Interrupt
+					TakeTrap(3, 3, 1, context);
+				} else if (csr_mip & csr_mie & 0x080) {
+					// Timer M-Mode Interrupt
+					TakeTrap(3, 7, 1, context);
+				} else if (csr_mip & csr_mie & 0x200) {
+					// External S-Mode Interrupt
+					if (csr_mideleg & 0x200) {
+						TakeTrap(1, 9, 1, context);
+					} else {
+						TakeTrap(3, 9, 1, context);
+					}
+				} else if (csr_mip & csr_mie & 0x002) {
+					// Software S-Mode Interrupt
+					if (csr_mideleg & 0x002) {
+						TakeTrap(1, 1, 1, context);
+					} else {
+						TakeTrap(3, 1, 1, context);
+					}
+				} else if (csr_mip & csr_mie & 0x020) {
+					// Timer S-Mode Interrupt
+					if (csr_mideleg & 0x020) {
+						TakeTrap(1, 5, 1, context);
+					} else {
+						TakeTrap(3, 5, 1, context);
+					}
+				}
+			} else if (exec_mode == 1) {
+				// S-Mode
+				if        (csr_mip & csr_mie & 0x800) {
+					// External M-Mode Interrupt
+					TakeTrap(3, 11, 1, context);
+				} else if (csr_mip & csr_mie & 0x008) {
+					// Software M-Mode Interrupt
+					TakeTrap(3, 3, 1, context);
+				} else if (csr_mip & csr_mie & 0x080) {
+					// Timer M-Mode Interrupt
+					TakeTrap(3, 7, 1, context);
+				} else if (csr_mip & csr_mie & 0x200 & ~csr_mideleg) {
+					// External S-Mode Interrupt - Not Delegated
+					TakeTrap(3, 9, 1, context);
+				} else if (csr_mip & csr_mie & 0x200 &  csr_mideleg && csr_mstatus & 0x2) {
+					// External S-Mode Interrupt - Delegated
+					TakeTrap(1, 9, 1, context);
+				} else if (csr_mip & csr_mie & 0x002 & ~csr_mideleg) {
+					// Software S-Mode Interrupt - Not Delegated
+					TakeTrap(3, 1, 1, context);
+				} else if (csr_mip & csr_mie & 0x002 &  csr_mideleg && csr_mstatus & 0x2) {
+					// Software S-Mode Interrupt - Delegated
+					TakeTrap(1, 1, 1, context);
+				} else if (csr_mip & csr_mie & 0x020 & ~csr_mideleg) {
+					// Timer S-Mode Interrupt - Not Delegated
+					TakeTrap(3, 5, 1, context);
+				} else if (csr_mip & csr_mie & 0x020 &  csr_mideleg && csr_mstatus & 0x2) {
+					// Timer S-Mode Interrupt - Delegated
+					TakeTrap(1, 5, 1, context);
+				}
+			} else {
+				// M-Mode
+				if        (csr_mstatus & 0x8) {
+					if        (csr_mip & csr_mie & 0x800) {
+						// External M-Mode Interrupt
+						TakeTrap(3, 11, 1, context);
+					} else if (csr_mip & csr_mie & 0x008) {
+						// Software M-Mode Interrupt
+						TakeTrap(3, 3, 1, context);
+					} else if (csr_mip & csr_mie & 0x080) {
+						// Timer M-Mode Interrupt
+						TakeTrap(3, 7, 1, context);
+					} else if (csr_mip & csr_mie & 0x200 & ~csr_mideleg) {
+						// External S-Mode Interrupt - Not Delegated
+						TakeTrap(3, 9, 1, context);
+					} else if (csr_mip & csr_mie & 0x002 & ~csr_mideleg) {
+						// Software S-Mode Interrupt - Not Delegated
+						TakeTrap(3, 1, 1, context);
+					} else if (csr_mip & csr_mie & 0x020 & ~csr_mideleg) {
+						// Timer S-Mode Interrupt - Not Delegated
+						TakeTrap(3, 5, 1, context);
+					}
+				}
+			}
+		}
+		
+		if (debug) {
+			dprintf(STDERR, "DBG PC: 0x%08X\n", context->pc);
+		}
+		
+		struct retvals rtn;
+		rtn = ExecMemory(context->pc, context);
+		if (rtn.error == CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
+			rtn.error = ExecuteInstruction(rtn.value, context);
+		}
+		
+		if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
+			if (rtn.error == CUSTOM_INTERNAL_WFI_SLEEP) {
+				// TODO WFI
+				break; // Temp Hack
+			}
+			/*
+			if (rtn.error == ILLEGAL_INSTRUCTION) {
+				dprintf(STDOUT, "ILLEGAL_INSTRUCTION\n");
+				print_reg_state(context);
+			}
+			*/
+			TakeTrap(3, rtn.error, 0, context);
+		}
+	}
+	
+	return 1;
 }
 
 void InitEmu(struct cpu_context* context) {
 	memset(context, 0, sizeof(struct cpu_context));
 	context->pc = 0x80000000;
 	context->mode = 3;
+	context->lr_reserve_set = (sint32_t)-1;
 	context->csr[CSR_MISA] = 0x40000000 | (1 << 0) | (1 << 8) | (1 << 18) | (1 << 20);
 	
 	// PLIC Regs
@@ -2123,6 +2592,10 @@ void InitEmu(struct cpu_context* context) {
 	// CLINT Regs
 	clint_mtimecmp = 0;
 	clint_mtimecmph = 0;
+	// Internal
+	clint_time = 0;
+	clint_timeh = 0;
+	clock_gettime(CLOCK_REALTIME, &clint_start_time);
 	
 	// UART Regs
 	uart0_txdata = 0;
@@ -2140,9 +2613,10 @@ void InitEmu(struct cpu_context* context) {
 }
 
 void RunEmulator(struct cpu_context* context) {
-	InitEmu(context);
-	while (1) {
-		RunLoop(context);
+	debug = 0;
+	int loop = 1;
+	while (loop) {
+		loop = RunLoop(context);
 	}
 	return;
 }
@@ -2211,9 +2685,25 @@ signed int main(unsigned int argc, char *argv[], char *envp[]) {
 	struct cpu_context context;
 	memset(&context, 0, sizeof(struct cpu_context));
 	
-	while (1) {
-	}
+	// START: Setup the Terminal
+  // Set TTY to Raw mode
+  struct termios old_tty_settings;
+  {
+    struct termios raw_tty_settings;
+    signed int retval;
+    retval = ioctl(STDIN, TCGETS, &old_tty_settings);
+    memcpy(&raw_tty_settings, &old_tty_settings, sizeof(struct termios));
+    raw_tty_settings.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
+    raw_tty_settings.c_oflag &= ~OPOST;
+    raw_tty_settings.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+    raw_tty_settings.c_cflag &= ~(CSIZE | PARENB);
+    raw_tty_settings.c_cflag |= CS8;
+    retval = ioctl(STDIN, TCSETS, &raw_tty_settings);
+  }
 	
+	InitEmu(&context);
+	RunEmulator(&context);
+		
 	free(mmdata);
 	free(memory);
 	return 0;
