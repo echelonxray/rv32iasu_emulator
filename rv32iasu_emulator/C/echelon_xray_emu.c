@@ -13,12 +13,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
+#include <termios.h>
+#include <poll.h>
 
 //#define DEBUG
 //#define DEBUG_Trap
 //#define DEBUG1
+
+#define PLIC_SOURCENUM_UART 10
 
 typedef int32_t sint32_t;
 
@@ -134,10 +139,21 @@ struct cpu_context {
 // Physical Memory-Map Of Emulator:
 // 0x1000_0000: UART
 // 0x2000_0000: Memory-Mapped Data (Filesystem CPIO Image)
-// 0x3000_0000: mtimecmp
-// 0x3200_0000: CLINT
-// 0x4000_0000: PLIC
+//// 0x3200_0000: CLINT
+//// 0x4000_0000: PLIC
+// 0x0200_0000: CLINT
+// 0x0C00_0000: PLIC
 // 0x8000_0000: RAM
+#define ADDR_RAM_START  0x80000000
+#define ADDR_RAM_LENGTH 0x08000000
+#define ADDR_PLIC_START  0x0C000000
+#define ADDR_PLIC_LENGTH 0x00210000
+#define ADDR_CLINT_START  0x02000000
+#define ADDR_CLINT_LENGTH 0x00010000
+#define ADDR_UART_START  0x10000000
+#define ADDR_UART_LENGTH 0x00001000
+#define ADDR_DATAIMAGE_START  0x20000000
+#define ADDR_DATAIMAGE_LENGTH 0x10000000
 
 void* mmdata; // 0x2000_0000
 void* memory; // 0x8000_0000
@@ -150,7 +166,7 @@ uint32_t tlb_perm;
 */
 
 // PLIC Regs
-uint32_t plic_source_priorities; //       Offset 0x0000_0000
+uint32_t plic_source_priority; //       Offset 0x0000_0000
 uint32_t plic_pending_array;     //       Offset 0x0000_1000
 uint32_t plic_h0_m_inter_en;     // Start Offset 0x0000_2000, Inc: 0x0000_0080
 uint32_t plic_h0_s_inter_en;
@@ -168,18 +184,24 @@ uint32_t clint_timeh;
 struct timespec clint_start_time;
 
 // UART0 Regs
-uint32_t uart0_txdata;
-uint32_t uart0_rxdata;
-uint32_t uart0_txctrl;
-uint32_t uart0_rxctrl;
-uint32_t uart0_ie;
-uint32_t uart0_ip;
-uint32_t uart0_div;
+uint32_t uart0_rhr;
+uint32_t uart0_thr;
+uint32_t uart0_ier;
+uint32_t uart0_isr;
+uint32_t uart0_fcr;
+uint32_t uart0_lcr;
+uint32_t uart0_mcr;
+uint32_t uart0_lsr;
+uint32_t uart0_msr;
+uint32_t uart0_spr;
+uint32_t uart0_dll;
+uint32_t uart0_dlm;
+uint32_t uart0_psd;
 // Internal
-uint32_t uart0_rxcue;
+//uint32_t uart0_rxcue;
 uint32_t uart0_rxcuecount;
 
-int debug;
+//int debug;
 
 void print_reg_state(struct cpu_context *context) {
 	dprintf(STDOUT, "----Print Reg State----\n");
@@ -198,7 +220,7 @@ static inline uint32_t ReadPhysMemory(uint32_t addr, unsigned int bitwidth, stru
 	}
 #endif
 	
-	if        (addr >= 0x80000000 && addr < 0x88000000) {
+	if        (addr >= ADDR_RAM_START && addr < ADDR_RAM_START + ADDR_RAM_LENGTH) {
 		addr -= 0x80000000;
 		if        (bitwidth == 32) {
 			uint32_t* ptr = memory + addr;
@@ -210,11 +232,11 @@ static inline uint32_t ReadPhysMemory(uint32_t addr, unsigned int bitwidth, stru
 			uint8_t*  ptr = memory + addr;
 			return (uint32_t)(*ptr);
 		}
-	} else if (addr >= 0x40000000 && addr < 0x44000000) {
-		addr -= 0x40000000;
+	} else if (addr >= ADDR_PLIC_START && addr < ADDR_PLIC_START + ADDR_PLIC_LENGTH) {
+		addr -= ADDR_PLIC_START;
 		if (bitwidth == 32) {
-			if        (addr == 0x000004) {
-				return plic_source_priorities;
+			if        (addr == 0x000004 * PLIC_SOURCENUM_UART) {
+				return plic_source_priority;
 			} else if (addr == 0x001000) {
 				return plic_pending_array;
 			} else if (addr == 0x002000) {
@@ -231,8 +253,8 @@ static inline uint32_t ReadPhysMemory(uint32_t addr, unsigned int bitwidth, stru
 				return plic_h0_s_claim_compl;
 			}
 		}
-	} else if (addr >= 0x32000000 && addr < 0x32010000) {
-		addr -= 0x32000000;
+	} else if (addr >= ADDR_CLINT_START && addr < ADDR_CLINT_START + ADDR_CLINT_LENGTH) {
+		addr -= ADDR_CLINT_START;
 		if (bitwidth == 32) {
 			if        (addr == 0x00000) {
 				return (context->csr[CSR_MIP] & 0x8) >> 3;
@@ -242,8 +264,8 @@ static inline uint32_t ReadPhysMemory(uint32_t addr, unsigned int bitwidth, stru
 				return clint_mtimecmph;
 			}
 		}
-	} else if (addr >= 0x20000000 && addr < 0x30000000) {
-		addr -= 0x20000000;
+	} else if (addr >= ADDR_DATAIMAGE_START && addr < ADDR_DATAIMAGE_START + ADDR_DATAIMAGE_LENGTH) {
+		addr -= ADDR_DATAIMAGE_START;
 		if (addr < mmdata_length) {
 			if        (bitwidth == 32) {
 				uint32_t* ptr = mmdata + addr;
@@ -256,31 +278,54 @@ static inline uint32_t ReadPhysMemory(uint32_t addr, unsigned int bitwidth, stru
 				return (uint32_t)(*ptr);
 			}
 		}
-	} else if (addr >= 0x10000000 && addr < 0x10001000) {
-		addr -= 0x10000000;
-		if (bitwidth == 32) {
+	} else if (addr >= ADDR_UART_START && addr < ADDR_UART_START + ADDR_UART_LENGTH) {
+		addr -= ADDR_UART_START;
+		if (bitwidth == 8) {
 			if        (addr == 0x00) {
-				// txdata
-				return 0;
+				// rhr / dll
+				if (uart0_lcr & 0x80) {
+					dprintf(STDERR, "Loa1 Addr: 0x%02X, Value 0x%02X\n", addr, uart0_dll & 0xFF);
+					return uart0_dll;
+				} else {
+					dprintf(STDERR, "Loa0 Addr: 0x%02X, Value 0x%02X\n", addr, uart0_rhr & 0xFF);
+					return uart0_rhr;
+				}
+			} else if (addr == 0x01) {
+				// ier / dlm
+				if (uart0_lcr & 0x80) {
+					dprintf(STDERR, "Loa1 Addr: 0x%02X, Value 0x%02X\n", addr, uart0_dlm & 0xFF);
+					return uart0_dlm;
+				} else {
+					dprintf(STDERR, "Loa0 Addr: 0x%02X, Value 0x%02X\n", addr, uart0_ier & 0xFF);
+					return uart0_ier;
+				}
+			} else if (addr == 0x02) {
+				// isr
+				dprintf(STDERR, "Load Addr: 0x%02X, Value 0x%02X\n", addr, uart0_isr & 0xFF);
+				return uart0_isr;
+			} else if (addr == 0x03) {
+				// lcr
+				dprintf(STDERR, "Load Addr: 0x%02X, Value 0x%02X\n", addr, uart0_lcr & 0xFF);
+				return uart0_lcr;
 			} else if (addr == 0x04) {
-				// rxdata
-				return 0;
-			} else if (addr == 0x08) {
-				// txctrl
-				return uart0_txctrl & 0x00070003;
-			} else if (addr == 0x0C) {
-				// rxctrl
-				return uart0_rxctrl & 0x00070001;
-			} else if (addr == 0x10) {
-				// ie
-				return uart0_ie     & 0x00000003;
-			} else if (addr == 0x14) {
-				// ip
-				return uart0_ip     & 0x00000003;
-			} else if (addr == 0x18) {
-				// div
-				return uart0_div    & 0x0000FFFF;
+				// mcr
+				dprintf(STDERR, "Load Addr: 0x%02X, Value 0x%02X\n", addr, uart0_mcr & 0xFF);
+				return uart0_mcr;
+			} else if (addr == 0x05) {
+				// lsr
+				dprintf(STDERR, "Load Addr: 0x%02X, Value 0x%02X\n", addr, uart0_lsr & 0xFF);
+				return uart0_lsr;
+			} else if (addr == 0x06) {
+				// msr
+				dprintf(STDERR, "Load Addr: 0x%02X, Value 0x%02X\n", addr, uart0_msr & 0xFF);
+				return uart0_msr;
+			} else if (addr == 0x07) {
+				// spr
+				dprintf(STDERR, "Load Addr: 0x%02X, Value 0x%02X\n", addr, uart0_spr & 0xFF);
+				return uart0_spr;
 			}
+		} else {
+			dprintf(STDOUT, "Read Bitwidth: %d\n", bitwidth);
 		}
 	}
 	return 0;
@@ -293,8 +338,8 @@ static inline void SavePhysMemory(uint32_t addr, unsigned int bitwidth, struct c
 	}
 #endif
 	
-	if        (addr >= 0x80000000 && addr < 0x88000000) {
-		addr -= 0x80000000;
+	if        (addr >= ADDR_RAM_START && addr < ADDR_RAM_START + ADDR_RAM_LENGTH) {
+		addr -= ADDR_RAM_START;
 		if        (bitwidth == 32) {
 			uint32_t* ptr = memory + addr;
 			*ptr = (uint32_t)value;
@@ -305,22 +350,23 @@ static inline void SavePhysMemory(uint32_t addr, unsigned int bitwidth, struct c
 			uint8_t*  ptr = memory + addr;
 			*ptr =  (uint8_t)value;
 		}
-	} else if (addr >= 0x40000000 && addr < 0x44000000) {
-		addr -= 0x40000000;
+	} else if (addr >= ADDR_PLIC_START && addr < ADDR_PLIC_START + ADDR_PLIC_LENGTH) {
+		addr -= ADDR_PLIC_START;
 		if (bitwidth == 32) {
-			if        (addr == 0x000004) {
-				plic_source_priorities = value & 0x7;
+			if        (addr == 0x000004 * PLIC_SOURCENUM_UART) {
+				plic_source_priority = value & 0x7;
 			} else if (addr == 0x001000) {
 				// pending_array - Do Nothing
 			} else if (addr == 0x002000) {
-				plic_h0_m_inter_en = value & 0x2;
+				plic_h0_m_inter_en = value & (1 << PLIC_SOURCENUM_UART);
 			} else if (addr == 0x002080) {
-				plic_h0_s_inter_en = value & 0x2;
+				plic_h0_s_inter_en = value & (1 << PLIC_SOURCENUM_UART);
 			} else if (addr == 0x200000) {
 				plic_h0_m_pri_thres = value & 0x7;
 			} else if (addr == 0x200004) {
 				// h0_m_claim_compl
-				if (value == 1) {
+				//dprintf(STDOUT, "mclaim: %X\n", value);
+				if (value == PLIC_SOURCENUM_UART) {
 					if (plic_h0_m_inter_en & (1 << value)) {
 						plic_pending_array &= ~(1 << value);
 					}
@@ -329,15 +375,16 @@ static inline void SavePhysMemory(uint32_t addr, unsigned int bitwidth, struct c
 				plic_h0_s_pri_thres = value & 0x7;
 			} else if (addr == 0x201004) {
 				// h0_s_claim_compl
-				if (value == 1) {
+				//dprintf(STDOUT, "sclaim: %X\n", value);
+				if (value == PLIC_SOURCENUM_UART) {
 					if (plic_h0_s_inter_en & (1 << value)) {
 						plic_pending_array &= ~(1 << value);
 					}
 				}
 			}
 		}
-	} else if (addr >= 0x32000000 && addr < 0x32010000) {
-		addr -= 0x32000000;
+	} else if (addr >= ADDR_CLINT_START && addr < ADDR_CLINT_START + ADDR_CLINT_LENGTH) {
+		addr -= ADDR_CLINT_START;
 		if (bitwidth == 32) {
 			if        (addr == 0x00000) {
 				if (value & 0x1) {
@@ -351,13 +398,69 @@ static inline void SavePhysMemory(uint32_t addr, unsigned int bitwidth, struct c
 				clint_mtimecmph = value;
 			}
 		}
-	} else if (addr >= 0x10000000 && addr < 0x10001000) {
-		addr -= 0x10000000;
-		if (bitwidth == 32) {
+	} else if (addr >= ADDR_UART_START && addr < ADDR_UART_START + ADDR_UART_LENGTH) {
+		addr -= ADDR_UART_START;
+		/*
+		if (context->mode < 3) {
+			dprintf(STDOUT, "?2");
+		}
+		*/
+		
+		if (bitwidth == 8) {
 			if        (addr == 0x00) {
-				// txdata
-				dprintf(STDOUT, "%c", value);
+				// thr / dll
+				if (uart0_lcr & 0x80) {
+					// dll
+					uart0_dll = value & 0xFF;
+					dprintf(STDERR, "Sav1 Addr: 0x%02X, Value 0x%02X\n", addr, value & 0xFF);
+				} else {
+					// thr - TX Data
+					dprintf(STDOUT, "%c", value & 0xFF);
+				}
+			} else if (addr == 0x01) {
+				// ier / dlm
+				if (uart0_lcr & 0x80) {
+					// dlm
+					uart0_dlm = value & 0xFF;
+					dprintf(STDERR, "Sav1 Addr: 0x%02X, Value 0x%02X\n", addr, value & 0xFF);
+				} else {
+					// ier
+					uart0_ier = value & 0x0F;
+					dprintf(STDERR, "Sav0 Addr: 0x%02X, Value 0x%02X\n", addr, value & 0xFF);
+				}
+			} else if (addr == 0x02) {
+				// fcr
+				uart0_fcr = value & 0xC7;
+				dprintf(STDERR, "Save Addr: 0x%02X, Value 0x%02X\n", addr, value & 0xFF);
+			} else if (addr == 0x03) {
+				// lcr
+				uart0_lcr = value & 0xFF;
+				dprintf(STDERR, "Save Addr: 0x%02X, Value 0x%02X\n", addr, value & 0xFF);
 			} else if (addr == 0x04) {
+				// mcr
+				uart0_mcr = value & 0x1F;
+				dprintf(STDERR, "Save Addr: 0x%02X, Value 0x%02X\n", addr, value & 0xFF);
+			} else if (addr == 0x05) {
+				// psd
+				uart0_psd = value & 0x0F;
+				dprintf(STDERR, "Save Addr: 0x%02X, Value 0x%02X\n", addr, value & 0xFF);
+			} else if (addr == 0x07) {
+				// spr
+				uart0_spr = value & 0xFF;
+				dprintf(STDERR, "Save Addr: 0x%02X, Value 0x%02X\n", addr, value & 0xFF);
+			}
+		} else {
+			dprintf(STDOUT, "Save Bitwidth: %d\n", bitwidth);
+		}
+		
+		//if (bitwidth == 8) {
+		//if (bitwidth == 32) {
+			//if        (addr == 0x00) {
+				// txdata
+				//dprintf(STDOUT, "%c", value);
+			//}
+			/*
+			else if (addr == 0x04) {
 				// rxdata
 				// Do Nothing
 			} else if (addr == 0x08) {
@@ -376,7 +479,8 @@ static inline void SavePhysMemory(uint32_t addr, unsigned int bitwidth, struct c
 				// div
 				uart0_div = value    & 0x0000FFFF;
 			}
-		}
+			*/
+		//}
 	}
 	return;
 }
@@ -741,7 +845,7 @@ static inline struct retvals CSR_Read(uint32_t csr_addr, struct cpu_context* con
 	} else if (csr_addr == 0x343) {
 		rtn.value = context->csr[CSR_MTVAL];
 	} else if (csr_addr == 0x344) {
-		rtn.value = context->csr[CSR_MIP];
+		rtn.value = context->csr[CSR_MIP] & context->csr[CSR_MIE];
 	} else if (csr_addr == 0x100) {
 		rtn.value = context->csr[CSR_MSTATUS] & 0x000C0122; // SSTATUS
 	} else if (csr_addr == 0x104) {
@@ -757,7 +861,7 @@ static inline struct retvals CSR_Read(uint32_t csr_addr, struct cpu_context* con
 	} else if (csr_addr == 0x143) {
 		rtn.value = context->csr[CSR_STVAL];
 	} else if (csr_addr == 0x144) {
-		rtn.value = context->csr[CSR_MIP] & context->csr[CSR_MIDELEG]; // SIP
+		rtn.value = context->csr[CSR_MIP] & context->csr[CSR_MIE] & context->csr[CSR_MIDELEG]; // SIP
 	} else if (csr_addr == 0x180) {
 		rtn.value = context->csr[CSR_SATP];
 	} else if (csr_addr == 0xC01) {
@@ -802,6 +906,11 @@ static inline void CSR_Write(uint32_t csr_addr, struct cpu_context* context, uin
 	} else if (csr_addr == 0x344) {
 		context->csr[CSR_MIP] = value & 0x00000222;
 	} else if (csr_addr == 0x100) {
+		/*
+		if (debug && value & 0x2) {
+			dprintf(1, "EMU DBG: S-Mode Int Enable (sstatus)\n");
+		}
+		*/
 		context->csr[CSR_MSTATUS] = (context->csr[CSR_MSTATUS] & ~(0x000C0122)) | (value & 0x000C0122); // SSTATUS
 	} else if (csr_addr == 0x104) {
 		context->csr[CSR_MIE] = (context->csr[CSR_MIE] & ~(context->csr[CSR_MIDELEG])) | (value & context->csr[CSR_MIDELEG]); // SIE
@@ -824,7 +933,7 @@ static inline void CSR_Write(uint32_t csr_addr, struct cpu_context* context, uin
 	return;
 }
 
-static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
+static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_context* context) {
 	// Execute Instruction
 	
 #ifdef DEBUG
@@ -869,13 +978,19 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 		offset += context->pc;
 		if (offset & 0x3) {
 			// Instruction address misaligned
-			return INSTRUCTION_ADDRESS_MISALIGNED;
+			struct retvals rtn;
+			rtn.value = offset;
+			rtn.error = INSTRUCTION_ADDRESS_MISALIGNED;
+			return rtn;
 		}
 		if (J_rd(inst) != 0) {
 			RegVal[J_rd(inst)] = context->pc + 4;
 		}
 		context->pc = offset;
-		return CUSTOM_INTERNAL_EXECUTION_SUCCESS;
+		struct retvals rtn;
+		rtn.value = 0;
+		rtn.error = CUSTOM_INTERNAL_EXECUTION_SUCCESS;
+		return rtn;
 		
 	} else if (OPCODE(inst) == 0x67) {
 		// Possible: JALR
@@ -897,16 +1012,25 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 			offset &= 0xFFFFFFFE;
 			if (offset & 0x3) {
 				// Misaligned Exception
-				return INSTRUCTION_ADDRESS_MISALIGNED;
+				struct retvals rtn;
+				rtn.value = offset;
+				rtn.error = INSTRUCTION_ADDRESS_MISALIGNED;
+				return rtn;
 			}
 			if (I_rd(inst) != 0) {
 				RegVal[I_rd(inst)] = context->pc + 4;
 			}
 			context->pc = offset;
-			return CUSTOM_INTERNAL_EXECUTION_SUCCESS;
+			struct retvals rtn;
+			rtn.value = 0;
+			rtn.error = CUSTOM_INTERNAL_EXECUTION_SUCCESS;
+			return rtn;
 		} else {
 			// Invalid Op-code
-			return ILLEGAL_INSTRUCTION;
+			struct retvals rtn;
+			rtn.value = inst;
+			rtn.error = ILLEGAL_INSTRUCTION;
+			return rtn;
 		}
 		
 	} else if (OPCODE(inst) == 0x63) {
@@ -1012,16 +1136,25 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 			
 		} else {
 			// Invalid Op-code
-			return ILLEGAL_INSTRUCTION;
+			struct retvals rtn;
+			rtn.value = inst;
+			rtn.error = ILLEGAL_INSTRUCTION;
+			return rtn;
 		}
 		
 		if (take_branch) {
 			if (offset & 0x3) {
 				// Misaligned Exception
-				return INSTRUCTION_ADDRESS_MISALIGNED;
+				struct retvals rtn;
+				rtn.value = offset;
+				rtn.error = INSTRUCTION_ADDRESS_MISALIGNED;
+				return rtn;
 			}
 			context->pc = offset;
-			return CUSTOM_INTERNAL_EXECUTION_SUCCESS;
+			struct retvals rtn;
+			rtn.value = 0;
+			rtn.error = CUSTOM_INTERNAL_EXECUTION_SUCCESS;
+			return rtn;
 		}
 		
 	} else if (OPCODE(inst) == 0x03) {
@@ -1052,7 +1185,8 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 			struct retvals rtn;
 			rtn = ReadMemory(offset, 8, context);
 			if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
-				return rtn.error;
+				rtn.value = offset;
+				return rtn;
 			}
 			rd = rtn.value;
 			
@@ -1076,7 +1210,8 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 			struct retvals rtn;
 			rtn = ReadMemory(offset, 16, context);
 			if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
-				return rtn.error;
+				rtn.value = offset;
+				return rtn;
 			}
 			rd = rtn.value;
 			
@@ -1095,13 +1230,17 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 			struct retvals rtn;
 			rtn = ReadMemory(offset, 32, context);
 			if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
-				return rtn.error;
+				rtn.value = offset;
+				return rtn;
 			}
 			rd = rtn.value;
 			
 		} else {
 			// Invalid Op-code
-			return ILLEGAL_INSTRUCTION;
+			struct retvals rtn;
+			rtn.value = inst;
+			rtn.error = ILLEGAL_INSTRUCTION;
+			return rtn;
 		}
 		
 #ifdef DEBUG1
@@ -1136,7 +1275,8 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 			struct retvals rtn;
 			rtn = SaveMemory(offset, 8, context, RegVal[S_rs2(inst)] & 0xFF);
 			if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
-				return rtn.error;
+				rtn.value = offset;
+				return rtn;
 			}
 			
 		} else if (S_funct3(inst) == 0x1) {
@@ -1149,7 +1289,8 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 			struct retvals rtn;
 			rtn = SaveMemory(offset, 16, context, RegVal[S_rs2(inst)] & 0xFFFF);
 			if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
-				return rtn.error;
+				rtn.value = offset;
+				return rtn;
 			}
 			
 		} else if (S_funct3(inst) == 0x2) {
@@ -1162,12 +1303,16 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 			struct retvals rtn;
 			rtn = SaveMemory(offset, 32, context, RegVal[S_rs2(inst)]);
 			if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
-				return rtn.error;
+				rtn.value = offset;
+				return rtn;
 			}
 			
 		} else {
 			// Invalid Op-code
-			return ILLEGAL_INSTRUCTION;
+			struct retvals rtn;
+			rtn.value = inst;
+			rtn.error = ILLEGAL_INSTRUCTION;
+			return rtn;
 		}
 		
 	} else if (OPCODE(inst) == 0x13) {
@@ -1273,7 +1418,10 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				
 			} else {
 				// Invalid Op-code
-				return ILLEGAL_INSTRUCTION;
+				struct retvals rtn;
+				rtn.value = inst;
+				rtn.error = ILLEGAL_INSTRUCTION;
+				return rtn;
 			}
 			
 		} else if (I_funct3(inst) == 0x5) {
@@ -1303,7 +1451,10 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				
 			} else {
 				// Invalid Op-code
-				return ILLEGAL_INSTRUCTION;
+				struct retvals rtn;
+				rtn.value = inst;
+				rtn.error = ILLEGAL_INSTRUCTION;
+				return rtn;
 			}
 		}
 		if (I_rd(inst) != 0) {
@@ -1345,7 +1496,10 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				
 			} else {
 				// Invalid Op-code
-				return ILLEGAL_INSTRUCTION;
+				struct retvals rtn;
+				rtn.value = inst;
+				rtn.error = ILLEGAL_INSTRUCTION;
+				return rtn;
 			}
 			
 		} else if (R_funct3(inst) == 0x1) {
@@ -1364,7 +1518,10 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				
 			} else {
 				// Invalid Op-code
-				return ILLEGAL_INSTRUCTION;
+				struct retvals rtn;
+				rtn.value = inst;
+				rtn.error = ILLEGAL_INSTRUCTION;
+				return rtn;
 			}
 			
 		} else if (R_funct3(inst) == 0x2) {
@@ -1387,7 +1544,10 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				
 			} else {
 				// Invalid Op-code
-				return ILLEGAL_INSTRUCTION;
+				struct retvals rtn;
+				rtn.value = inst;
+				rtn.error = ILLEGAL_INSTRUCTION;
+				return rtn;
 			}
 			
 		} else if (R_funct3(inst) == 0x3) {
@@ -1410,7 +1570,10 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				
 			} else {
 				// Invalid Op-code
-				return ILLEGAL_INSTRUCTION;
+				struct retvals rtn;
+				rtn.value = inst;
+				rtn.error = ILLEGAL_INSTRUCTION;
+				return rtn;
 			}
 			
 		} else if (R_funct3(inst) == 0x4) {
@@ -1429,7 +1592,10 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				
 			} else {
 				// Invalid Op-code
-				return ILLEGAL_INSTRUCTION;
+				struct retvals rtn;
+				rtn.value = inst;
+				rtn.error = ILLEGAL_INSTRUCTION;
+				return rtn;
 			}
 			
 		} else if (R_funct3(inst) == 0x5) {
@@ -1459,7 +1625,10 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				
 			} else {
 				// Invalid Op-code
-				return ILLEGAL_INSTRUCTION;
+				struct retvals rtn;
+				rtn.value = inst;
+				rtn.error = ILLEGAL_INSTRUCTION;
+				return rtn;
 			}
 			
 		} else if (R_funct3(inst) == 0x6) {
@@ -1478,7 +1647,10 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				
 			} else {
 				// Invalid Op-code
-				return ILLEGAL_INSTRUCTION;
+				struct retvals rtn;
+				rtn.value = inst;
+				rtn.error = ILLEGAL_INSTRUCTION;
+				return rtn;
 			}
 			
 		} else if (R_funct3(inst) == 0x7) {
@@ -1497,7 +1669,10 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				
 			} else {
 				// Invalid Op-code
-				return ILLEGAL_INSTRUCTION;
+				struct retvals rtn;
+				rtn.value = inst;
+				rtn.error = ILLEGAL_INSTRUCTION;
+				return rtn;
 			}
 			
 		}
@@ -1529,7 +1704,10 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 			
 		} else {
 			// Invalid Op-code
-			return ILLEGAL_INSTRUCTION;
+			struct retvals rtn;
+			rtn.value = inst;
+			rtn.error = ILLEGAL_INSTRUCTION;
+			return rtn;
 		}
 		
 	} else if (OPCODE(inst) == 0x2F) {
@@ -1547,7 +1725,10 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				
 				if (R_rs2(inst) != 0) {
 					// Invalid Op-code
-					return ILLEGAL_INSTRUCTION;
+					struct retvals rtn;
+					rtn.value = inst;
+					rtn.error = ILLEGAL_INSTRUCTION;
+					return rtn;
 				}
 				
 #ifdef DEBUG
@@ -1557,14 +1738,20 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				uint32_t addr = RegVal[R_rs1(inst)];
 				
 				if (addr & 0x3) {
-					return LOAD_ADDRESS_MISALIGNED;
+					struct retvals rtn;
+					rtn.value = addr;
+					rtn.error = LOAD_ADDRESS_MISALIGNED;
+					return rtn;
 				}
 				
 				if (context->mode < 3) {
 					struct retvals rtn;
 					rtn = WalkPTs(addr, context->csr[CSR_SATP], 0, context);
 					if (rtn.error) {
-						return LOAD_PAGE_FAULT;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = LOAD_PAGE_FAULT;
+						return rtn;
 					}
 					addr = rtn.value;
 				}
@@ -1588,14 +1775,20 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				uint32_t rs2b = RegVal[R_rs2(inst)];
 				
 				if (addr & 0x3) {
-					return LOAD_ADDRESS_MISALIGNED;
+					struct retvals rtn;
+					rtn.value = addr;
+					rtn.error = STORE_AMO_ADDRESS_MISALIGNED;
+					return rtn;
 				}
 				
 				if (context->mode < 3) {
 					struct retvals rtn;
 					rtn = WalkPTs(addr, context->csr[CSR_SATP], 0, context);
 					if (rtn.error) {
-						return STORE_AMO_PAGE_FAULT;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_PAGE_FAULT;
+						return rtn;
 					}
 					addr = rtn.value;
 				}
@@ -1625,15 +1818,25 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				rtn = ReadMemory(addr, 32, context);
 				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
 					if (rtn.error == LOAD_ADDRESS_MISALIGNED) {
-						return STORE_AMO_ADDRESS_MISALIGNED;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_ADDRESS_MISALIGNED;
+						return rtn;
 					}
 					if (rtn.error == LOAD_PAGE_FAULT) {
-						return STORE_AMO_PAGE_FAULT;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_PAGE_FAULT;
+						return rtn;
 					}
 					if (rtn.error == LOAD_ACCESS_FAULT) {
-						return STORE_AMO_ACCESS_FAULT;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_ACCESS_FAULT;
+						return rtn;
 					}
-					return rtn.error;
+					rtn.value = 0;
+					return rtn;
 				}
 				uint32_t rd;
 				uint32_t working;
@@ -1644,7 +1847,8 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				
 				rtn = SaveMemory(addr, 32, context, working);
 				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
-					return rtn.error;
+					rtn.value = addr;
+					return rtn;
 				}
 				
 				if (R_rd(inst) != 0) {
@@ -1663,15 +1867,25 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				rtn = ReadMemory(addr, 32, context);
 				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
 					if (rtn.error == LOAD_ADDRESS_MISALIGNED) {
-						return STORE_AMO_ADDRESS_MISALIGNED;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_ADDRESS_MISALIGNED;
+						return rtn;
 					}
 					if (rtn.error == LOAD_PAGE_FAULT) {
-						return STORE_AMO_PAGE_FAULT;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_PAGE_FAULT;
+						return rtn;
 					}
 					if (rtn.error == LOAD_ACCESS_FAULT) {
-						return STORE_AMO_ACCESS_FAULT;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_ACCESS_FAULT;
+						return rtn;
 					}
-					return rtn.error;
+					rtn.value = 0;
+					return rtn;
 				}
 				uint32_t rd;
 				uint32_t working;
@@ -1682,7 +1896,8 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				
 				rtn = SaveMemory(addr, 32, context, working);
 				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
-					return rtn.error;
+					rtn.value = addr;
+					return rtn;
 				}
 				
 				if (R_rd(inst) != 0) {
@@ -1701,15 +1916,25 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				rtn = ReadMemory(addr, 32, context);
 				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
 					if (rtn.error == LOAD_ADDRESS_MISALIGNED) {
-						return STORE_AMO_ADDRESS_MISALIGNED;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_ADDRESS_MISALIGNED;
+						return rtn;
 					}
 					if (rtn.error == LOAD_PAGE_FAULT) {
-						return STORE_AMO_PAGE_FAULT;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_PAGE_FAULT;
+						return rtn;
 					}
 					if (rtn.error == LOAD_ACCESS_FAULT) {
-						return STORE_AMO_ACCESS_FAULT;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_ACCESS_FAULT;
+						return rtn;
 					}
-					return rtn.error;
+					rtn.value = 0;
+					return rtn;
 				}
 				uint32_t rd;
 				uint32_t working;
@@ -1720,7 +1945,8 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				
 				rtn = SaveMemory(addr, 32, context, working);
 				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
-					return rtn.error;
+					rtn.value = addr;
+					return rtn;
 				}
 				
 				if (R_rd(inst) != 0) {
@@ -1739,15 +1965,25 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				rtn = ReadMemory(addr, 32, context);
 				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
 					if (rtn.error == LOAD_ADDRESS_MISALIGNED) {
-						return STORE_AMO_ADDRESS_MISALIGNED;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_ADDRESS_MISALIGNED;
+						return rtn;
 					}
 					if (rtn.error == LOAD_PAGE_FAULT) {
-						return STORE_AMO_PAGE_FAULT;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_PAGE_FAULT;
+						return rtn;
 					}
 					if (rtn.error == LOAD_ACCESS_FAULT) {
-						return STORE_AMO_ACCESS_FAULT;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_ACCESS_FAULT;
+						return rtn;
 					}
-					return rtn.error;
+					rtn.value = 0;
+					return rtn;
 				}
 				uint32_t rd;
 				uint32_t working;
@@ -1758,7 +1994,8 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				
 				rtn = SaveMemory(addr, 32, context, working);
 				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
-					return rtn.error;
+					rtn.value = addr;
+					return rtn;
 				}
 				
 				if (R_rd(inst) != 0) {
@@ -1777,15 +2014,25 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				rtn = ReadMemory(addr, 32, context);
 				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
 					if (rtn.error == LOAD_ADDRESS_MISALIGNED) {
-						return STORE_AMO_ADDRESS_MISALIGNED;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_ADDRESS_MISALIGNED;
+						return rtn;
 					}
 					if (rtn.error == LOAD_PAGE_FAULT) {
-						return STORE_AMO_PAGE_FAULT;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_PAGE_FAULT;
+						return rtn;
 					}
 					if (rtn.error == LOAD_ACCESS_FAULT) {
-						return STORE_AMO_ACCESS_FAULT;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_ACCESS_FAULT;
+						return rtn;
 					}
-					return rtn.error;
+					rtn.value = 0;
+					return rtn;
 				}
 				uint32_t rd;
 				uint32_t working;
@@ -1796,7 +2043,8 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				
 				rtn = SaveMemory(addr, 32, context, working);
 				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
-					return rtn.error;
+					rtn.value = addr;
+					return rtn;
 				}
 				
 				if (R_rd(inst) != 0) {
@@ -1815,15 +2063,25 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				rtn = ReadMemory(addr, 32, context);
 				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
 					if (rtn.error == LOAD_ADDRESS_MISALIGNED) {
-						return STORE_AMO_ADDRESS_MISALIGNED;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_ADDRESS_MISALIGNED;
+						return rtn;
 					}
 					if (rtn.error == LOAD_PAGE_FAULT) {
-						return STORE_AMO_PAGE_FAULT;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_PAGE_FAULT;
+						return rtn;
 					}
 					if (rtn.error == LOAD_ACCESS_FAULT) {
-						return STORE_AMO_ACCESS_FAULT;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_ACCESS_FAULT;
+						return rtn;
 					}
-					return rtn.error;
+					rtn.value = 0;
+					return rtn;
 				}
 				uint32_t rd;
 				uint32_t working;
@@ -1840,7 +2098,8 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				
 				rtn = SaveMemory(addr, 32, context, working);
 				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
-					return rtn.error;
+					rtn.value = addr;
+					return rtn;
 				}
 				
 				if (R_rd(inst) != 0) {
@@ -1859,15 +2118,25 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				rtn = ReadMemory(addr, 32, context);
 				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
 					if (rtn.error == LOAD_ADDRESS_MISALIGNED) {
-						return STORE_AMO_ADDRESS_MISALIGNED;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_ADDRESS_MISALIGNED;
+						return rtn;
 					}
 					if (rtn.error == LOAD_PAGE_FAULT) {
-						return STORE_AMO_PAGE_FAULT;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_PAGE_FAULT;
+						return rtn;
 					}
 					if (rtn.error == LOAD_ACCESS_FAULT) {
-						return STORE_AMO_ACCESS_FAULT;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_ACCESS_FAULT;
+						return rtn;
 					}
-					return rtn.error;
+					rtn.value = 0;
+					return rtn;
 				}
 				uint32_t rd;
 				uint32_t working;
@@ -1884,7 +2153,8 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				
 				rtn = SaveMemory(addr, 32, context, working);
 				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
-					return rtn.error;
+					rtn.value = addr;
+					return rtn;
 				}
 				
 				if (R_rd(inst) != 0) {
@@ -1903,15 +2173,25 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				rtn = ReadMemory(addr, 32, context);
 				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
 					if (rtn.error == LOAD_ADDRESS_MISALIGNED) {
-						return STORE_AMO_ADDRESS_MISALIGNED;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_ADDRESS_MISALIGNED;
+						return rtn;
 					}
 					if (rtn.error == LOAD_PAGE_FAULT) {
-						return STORE_AMO_PAGE_FAULT;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_PAGE_FAULT;
+						return rtn;
 					}
 					if (rtn.error == LOAD_ACCESS_FAULT) {
-						return STORE_AMO_ACCESS_FAULT;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_ACCESS_FAULT;
+						return rtn;
 					}
-					return rtn.error;
+					rtn.value = 0;
+					return rtn;
 				}
 				uint32_t rd;
 				uint32_t working;
@@ -1928,7 +2208,8 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				
 				rtn = SaveMemory(addr, 32, context, working);
 				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
-					return rtn.error;
+					rtn.value = addr;
+					return rtn;
 				}
 				
 				if (R_rd(inst) != 0) {
@@ -1947,15 +2228,25 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				rtn = ReadMemory(addr, 32, context);
 				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
 					if (rtn.error == LOAD_ADDRESS_MISALIGNED) {
-						return STORE_AMO_ADDRESS_MISALIGNED;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_ADDRESS_MISALIGNED;
+						return rtn;
 					}
 					if (rtn.error == LOAD_PAGE_FAULT) {
-						return STORE_AMO_PAGE_FAULT;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_PAGE_FAULT;
+						return rtn;
 					}
 					if (rtn.error == LOAD_ACCESS_FAULT) {
-						return STORE_AMO_ACCESS_FAULT;
+						struct retvals rtn;
+						rtn.value = addr;
+						rtn.error = STORE_AMO_ACCESS_FAULT;
+						return rtn;
 					}
-					return rtn.error;
+					rtn.value = 0;
+					return rtn;
 				}
 				uint32_t rd;
 				uint32_t working;
@@ -1972,7 +2263,8 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				
 				rtn = SaveMemory(addr, 32, context, working);
 				if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
-					return rtn.error;
+					rtn.value = addr;
+					return rtn;
 				}
 				
 				if (R_rd(inst) != 0) {
@@ -1981,12 +2273,18 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				
 			} else {
 				// Invalid Op-code
-				return ILLEGAL_INSTRUCTION;
+				struct retvals rtn;
+				rtn.value = inst;
+				rtn.error = ILLEGAL_INSTRUCTION;
+				return rtn;
 			}
 			
 		} else {
 			// Invalid Op-code
-			return ILLEGAL_INSTRUCTION;
+			struct retvals rtn;
+			rtn.value = inst;
+			rtn.error = ILLEGAL_INSTRUCTION;
+			return rtn;
 		}
 		
 	} else if (OPCODE(inst) == 0x73) {
@@ -2005,7 +2303,10 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 			
 			if (I_rd(inst) != 0) {
 				// Invalid Op-code
-				return ILLEGAL_INSTRUCTION;
+				struct retvals rtn;
+				rtn.value = inst;
+				rtn.error = ILLEGAL_INSTRUCTION;
+				return rtn;
 			}
 			
 			if        (I_imm(inst) == 0) {
@@ -2013,7 +2314,10 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				
 				if (I_rs1(inst) != 0) {
 					// Invalid Op-code
-					return ILLEGAL_INSTRUCTION;
+					struct retvals rtn;
+					rtn.value = inst;
+					rtn.error = ILLEGAL_INSTRUCTION;
+					return rtn;
 				}
 				
 #ifdef DEBUG
@@ -2022,35 +2326,60 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				
 				if        (context->mode == 0) {
 					// U-Mode
-					return ENVIRONMENT_CALL_FROM_U_MODE;
+					struct retvals rtn;
+					rtn.value = 0;
+					rtn.error = ENVIRONMENT_CALL_FROM_U_MODE;
+					return rtn;
 				} else if (context->mode == 1) {
 					// S-Mode
-					return ENVIRONMENT_CALL_FROM_S_MODE;
+					struct retvals rtn;
+					rtn.value = 0;
+					rtn.error = ENVIRONMENT_CALL_FROM_S_MODE;
+					return rtn;
 				} else {// context->mode == 3
 					// M-Mode
-					return ENVIRONMENT_CALL_FROM_M_MODE;
+					struct retvals rtn;
+					rtn.value = 0;
+					rtn.error = ENVIRONMENT_CALL_FROM_M_MODE;
+					return rtn;
 				}
 				
 			} else if (I_imm(inst) == 1) {
 				// Instruction: EBREAK
 				
+				//debug = 1;
+				
 				if (I_rs1(inst) != 0) {
 					// Invalid Op-code
-					return ILLEGAL_INSTRUCTION;
+					struct retvals rtn;
+					rtn.value = inst;
+					rtn.error = ILLEGAL_INSTRUCTION;
+					return rtn;
 				}
 				
 #ifdef DEBUG
 				dprintf(STDERR, "\tEBREAK\n");
 #endif
 				
-				return BREAKPOINT;
+				/* TODO
+				struct retvals rtn;
+				rtn.value = 0;
+				rtn.error = BREAKPOINT;
+				return rtn;
+				*/
+				
+				//debug = 2;
+				//dprintf(1, "TraceA\n");
 				
 			} else if (I_imm(inst) == 0x102) {
 				// Instruction: SRET
 				
 				if (I_rs1(inst) != 0 || context->mode < 0x1) {
 					// Invalid Op-code
-					return ILLEGAL_INSTRUCTION;
+					struct retvals rtn;
+					rtn.value = inst;
+					rtn.error = ILLEGAL_INSTRUCTION;
+					return rtn;
 				}
 				
 #if defined(DEBUG) || defined(DEBUG_Trap)
@@ -2065,21 +2394,31 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				context->mode = bits_pp;
 				context->pc = context->csr[CSR_SEPC];
 				context->lr_reserve_set = (sint32_t)-1;
-				return CUSTOM_INTERNAL_EXECUTION_SUCCESS;
+				
+				struct retvals rtn;
+				rtn.value = 0;
+				rtn.error = CUSTOM_INTERNAL_EXECUTION_SUCCESS;
+				return rtn;
 				
 			} else if (I_imm(inst) == 0x302) {
 				// Instruction: MRET
 				
 				if (I_rs1(inst) != 0 || context->mode < 0x3) {
 					// Invalid Op-code
-					return ILLEGAL_INSTRUCTION;
+					struct retvals rtn;
+					rtn.value = inst;
+					rtn.error = ILLEGAL_INSTRUCTION;
+					return rtn;
 				}
 				
 				uint32_t bits_pp  = (context->csr[CSR_MSTATUS] >> 11) & 0x3;
 				uint32_t bits_pie = (context->csr[CSR_MSTATUS] >>  7) & 0x1;
 				if (bits_pp == 2) {
 					// Invalid Execution Mode
-					return ILLEGAL_INSTRUCTION;
+					struct retvals rtn;
+					rtn.value = inst;
+					rtn.error = ILLEGAL_INSTRUCTION;
+					return rtn;
 				}
 				
 #if defined(DEBUG) || defined(DEBUG_Trap)
@@ -2092,14 +2431,21 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				context->mode = bits_pp;
 				context->pc = context->csr[CSR_MEPC];
 				context->lr_reserve_set = (sint32_t)-1;
-				return CUSTOM_INTERNAL_EXECUTION_SUCCESS;
+				
+				struct retvals rtn;
+				rtn.value = 0;
+				rtn.error = CUSTOM_INTERNAL_EXECUTION_SUCCESS;
+				return rtn;
 				
 			} else if (I_imm(inst) == 0x105) {
 				// Instruction: WFI
 				
 				if (I_rs1(inst) != 0) {
 					// Invalid Op-code
-					return ILLEGAL_INSTRUCTION;
+					struct retvals rtn;
+					rtn.value = inst;
+					rtn.error = ILLEGAL_INSTRUCTION;
+					return rtn;
 				}
 				
 #ifdef DEBUG
@@ -2107,7 +2453,10 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 #endif
 				
 				context->pc += 4;
-				return CUSTOM_INTERNAL_WFI_SLEEP;
+				struct retvals rtn;
+				rtn.value = 0;
+				rtn.error = CUSTOM_INTERNAL_WFI_SLEEP;
+				return rtn;
 				
 			} else if (R_funct7(inst) == 0x09) {
 				// Instruction: SFENCE.VMA
@@ -2120,7 +2469,10 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				
 			} else {
 				// Invalid Op-code
-				return ILLEGAL_INSTRUCTION;
+				struct retvals rtn;
+				rtn.value = inst;
+				rtn.error = ILLEGAL_INSTRUCTION;
+				return rtn;
 			}
 		} else if (I_funct3(inst) == 0x1) {
 				// Instruction: CSRRW
@@ -2133,7 +2485,10 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				struct retvals rtn = CSR_Read(I_imm(inst), context, 1);
 				if (rtn.error) {
 					// CSR Read/Write Failed
-					return ILLEGAL_INSTRUCTION;
+					struct retvals rtn;
+					rtn.value = inst;
+					rtn.error = ILLEGAL_INSTRUCTION;
+					return rtn;
 				}
 				if (I_rd(inst) != 0) {
 					RegVal[I_rd(inst)] = rtn.value;
@@ -2157,7 +2512,10 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				struct retvals rtn = CSR_Read(I_imm(inst), context, perm);
 				if (rtn.error) {
 					// CSR Read/Write Failed
-					return ILLEGAL_INSTRUCTION;
+					struct retvals rtn;
+					rtn.value = inst;
+					rtn.error = ILLEGAL_INSTRUCTION;
+					return rtn;
 				}
 				if (I_rd(inst) != 0) {
 					RegVal[I_rd(inst)] = rtn.value;
@@ -2183,7 +2541,10 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				struct retvals rtn = CSR_Read(I_imm(inst), context, perm);
 				if (rtn.error) {
 					// CSR Read/Write Failed
-					return ILLEGAL_INSTRUCTION;
+					struct retvals rtn;
+					rtn.value = inst;
+					rtn.error = ILLEGAL_INSTRUCTION;
+					return rtn;
 				}
 				if (I_rd(inst) != 0) {
 					RegVal[I_rd(inst)] = rtn.value;
@@ -2203,7 +2564,10 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				struct retvals rtn = CSR_Read(I_imm(inst), context, 1);
 				if (rtn.error) {
 					// CSR Read/Write Failed
-					return ILLEGAL_INSTRUCTION;
+					struct retvals rtn;
+					rtn.value = inst;
+					rtn.error = ILLEGAL_INSTRUCTION;
+					return rtn;
 				}
 				if (I_rd(inst) != 0) {
 					RegVal[I_rd(inst)] = rtn.value;
@@ -2227,7 +2591,10 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				struct retvals rtn = CSR_Read(I_imm(inst), context, perm);
 				if (rtn.error) {
 					// CSR Read/Write Failed
-					return ILLEGAL_INSTRUCTION;
+					struct retvals rtn;
+					rtn.value = inst;
+					rtn.error = ILLEGAL_INSTRUCTION;
+					return rtn;
 				}
 				if (I_rd(inst) != 0) {
 					RegVal[I_rd(inst)] = rtn.value;
@@ -2253,7 +2620,10 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				struct retvals rtn = CSR_Read(I_imm(inst), context, perm);
 				if (rtn.error) {
 					// CSR Read/Write Failed
-					return ILLEGAL_INSTRUCTION;
+					struct retvals rtn;
+					rtn.value = inst;
+					rtn.error = ILLEGAL_INSTRUCTION;
+					return rtn;
 				}
 				if (I_rd(inst) != 0) {
 					RegVal[I_rd(inst)] = rtn.value;
@@ -2264,46 +2634,59 @@ static inline uint32_t ExecuteInstruction(uint32_t inst, struct cpu_context* con
 				
 		} else {
 			// Invalid Op-code
-			return ILLEGAL_INSTRUCTION;
+			struct retvals rtn;
+			rtn.value = inst;
+			rtn.error = ILLEGAL_INSTRUCTION;
+			return rtn;
 		}
 		
 	} else {
 		// Invalid Op-code
-		return ILLEGAL_INSTRUCTION;
+		struct retvals rtn;
+		rtn.value = inst;
+		rtn.error = ILLEGAL_INSTRUCTION;
+		return rtn;
 	}
 	
 	context->pc += 0x4;
-	return CUSTOM_INTERNAL_EXECUTION_SUCCESS;
+	struct retvals rtn;
+	rtn.value = 0;
+	rtn.error = CUSTOM_INTERNAL_EXECUTION_SUCCESS;
+	return rtn;
 }
 
 static inline void UpdateTimer(struct cpu_context* context) {
 	struct timespec curr_time;
 	clock_gettime(CLOCK_REALTIME, &curr_time);
 	
-	time_t tv_sec  = clint_start_time.tv_sec  - curr_time.tv_sec;
+	time_t tv_sec  = curr_time.tv_sec - clint_start_time.tv_sec;
 	long   tv_nsec;
-	if (clint_start_time.tv_nsec < curr_time.tv_nsec) {
-		tv_nsec = curr_time.tv_nsec - clint_start_time.tv_nsec;
+	if (clint_start_time.tv_nsec > curr_time.tv_nsec) {
+		tv_nsec = clint_start_time.tv_nsec - curr_time.tv_nsec;
 		tv_nsec = 1000000000 - tv_nsec;
 		tv_sec--;
 	} else {
-		tv_nsec = clint_start_time.tv_nsec - curr_time.tv_nsec;
+		tv_nsec = curr_time.tv_nsec - clint_start_time.tv_nsec;
 	}
 	
-	uint64_t up_time_ms;
-	up_time_ms  = tv_sec;
-	up_time_ms *= 1000;
-	up_time_ms += tv_nsec / 1000000;
+	uint64_t up_time_us;
+	up_time_us  = tv_sec;
+	up_time_us *= 1000000;
+	up_time_us += tv_nsec / 1000;
 	
-	clint_time  = (uint32_t)((up_time_ms >>  0) & 0xFFFFFFFF);
-	clint_timeh = (uint32_t)((up_time_ms >> 32) & 0xFFFFFFFF);
+	//up_time_us /= 1000;
 	
-	uint64_t cmp_time_ms;
-	cmp_time_ms   = clint_mtimecmph;
-	cmp_time_ms <<= 32;
-	cmp_time_ms  |= clint_mtimecmp;
+	//dprintf(STDOUT, "time: %ld\n", up_time_us);
 	
-	if (cmp_time_ms <= up_time_ms) { // TODO: Double-Check if '<=' or '<' in RISC-V specs
+	clint_time  = (uint32_t)((up_time_us >>  0) & 0xFFFFFFFF);
+	clint_timeh = (uint32_t)((up_time_us >> 32) & 0xFFFFFFFF);
+	
+	uint64_t cmp_time_us;
+	cmp_time_us   = clint_mtimecmph;
+	cmp_time_us <<= 32;
+	cmp_time_us  |= clint_mtimecmp;
+	
+	if (cmp_time_us <= up_time_us) { // TODO: Double-Check if '<=' or '<' in RISC-V specs
 		// Set timer interrupt
 		context->csr[CSR_MIP] |=  ((uint32_t)0x080);
 	} else {
@@ -2315,15 +2698,43 @@ static inline void UpdateTimer(struct cpu_context* context) {
 }
 
 static inline void UpdateUART() {
-	uart0_ip = 0;
-	uint32_t rx_thres = (uart0_rxctrl >> 16) & 0x7;
-	if (uart0_rxcuecount > rx_thres) {
-		uart0_ip |=  ((uint32_t)(1 << 1));
+	// Determine RX FIFO Threshold
+	uint32_t thresh = uart0_fcr >> 6;
+	if        (thresh == 0x0) {
+		thresh = 1;
+	} else if (thresh == 0x1) {
+		thresh = 4;
+	} else if (thresh == 0x2) {
+		thresh = 8;
 	} else {
-		uart0_ip &= ~((uint32_t)(1 << 1));
+		thresh = 14;
 	}
-	// It is not possible for the TX FIFO to fill in the emulated HW.
-	// Therefore, don't bother with it.
+	
+	// Check for interrupt in order of priority.
+	// Don't worry about error conditions in emulated HW.
+	if        ((uart0_ier & 0x01) &&  (uart0_fcr & 0x1) && (uart0_rxcuecount >= thresh)) {
+		// RX Data Interrupt Enabled
+		// FIFO Enabled.
+		// RX FIFO filled to Threshold
+		uart0_isr = 0x04;
+	} else if ((uart0_ier & 0x01) && !(uart0_fcr & 0x1)) {
+		// RX Data Interrupt Enabled
+		// FIFO Disabled.
+		// Data waiting in RX Buffer Register
+		uart0_isr = 0x04;
+	} else if  (uart0_ier & 0x02) {
+		// TX Empty Interrupt Enabled
+		// TX FIFO/Buffer Register is clear (Will always be the case in emulated HW)
+		uart0_isr = 0x02;
+	} else {
+		uart0_isr = 0x01;
+	}
+	
+	// Set the FIFO Enabled flags if the FIFOs are enabled
+	if (uart0_fcr & 0x1) {
+		uart0_isr |= 0xC0;
+	}
+	
 	return;
 }
 
@@ -2331,24 +2742,25 @@ static inline void UpdatePLIC(struct cpu_context* context) {
 	// Update Peripherals
 	UpdateUART();
 	
+	//plic_pending_array = 0;
 	// Update Pending Array from Peripherals
-	if (uart0_ip & uart0_ie) {
-		// Wired to Interrupt <1>
-		plic_pending_array |= (1 << 1);
+	if (!(uart0_isr & 0x1) && (uart0_mcr & 0x08)) {
+		// Wired to Interrupt <PLIC_SOURCENUM_UART>
+		plic_pending_array |= (1 << PLIC_SOURCENUM_UART);
 	}
 	
 	// Update mip.MEIP and mip.SEIP Bit Flags
 	context->csr[CSR_MIP] &= ~(1 << 11);
 	context->csr[CSR_MIP] &= ~(1 << 9);
-	if (plic_pending_array & (1 << 1)) {
-		uint32_t priorty = plic_source_priorities;
+	if (plic_pending_array & (1 << PLIC_SOURCENUM_UART)) {
+		uint32_t priorty = plic_source_priority;
 		if (plic_h0_m_pri_thres < priorty) {
-			if (plic_h0_m_inter_en & (1 << 1)) {
+			if (plic_h0_m_inter_en & (1 << PLIC_SOURCENUM_UART)) {
 				context->csr[CSR_MIP] |= (1 << 11);
 			}
 		}
 		if (plic_h0_s_pri_thres < priorty) {
-			if (plic_h0_s_inter_en & (1 << 1)) {
+			if (plic_h0_s_inter_en & (1 << PLIC_SOURCENUM_UART)) {
 				context->csr[CSR_MIP] |= (1 << 9);
 			}
 		}
@@ -2357,18 +2769,18 @@ static inline void UpdatePLIC(struct cpu_context* context) {
 	// Update Claim Registers
 	plic_h0_m_claim_compl = 0;
 	plic_h0_s_claim_compl = 0;
-	if (plic_pending_array & (1 << 1)) {
-		if (plic_h0_m_inter_en & (1 << 1)) {
-			plic_h0_m_claim_compl = 1;
+	if (plic_pending_array & (1 << PLIC_SOURCENUM_UART)) {
+		if (plic_h0_m_inter_en & (1 << PLIC_SOURCENUM_UART)) {
+			plic_h0_m_claim_compl = PLIC_SOURCENUM_UART;
 		}
-		if (plic_h0_s_inter_en & (1 << 1)) {
-			plic_h0_s_claim_compl = 1;
+		if (plic_h0_s_inter_en & (1 << PLIC_SOURCENUM_UART)) {
+			plic_h0_s_claim_compl = PLIC_SOURCENUM_UART;
 		}
 	}
 	return;
 }
 
-static inline void TakeTrap(uint32_t exec_mode, uint32_t cause, uint32_t is_interrupt, struct cpu_context* context) {
+static inline void TakeTrap(uint32_t exec_mode, uint32_t cause, uint32_t is_interrupt, uint32_t xtval, struct cpu_context* context) {
 #ifdef DEBUG_Trap
 	dprintf(STDERR, "[Trap] pc: 0x%X\n", context->pc);
 #endif
@@ -2392,7 +2804,7 @@ static inline void TakeTrap(uint32_t exec_mode, uint32_t cause, uint32_t is_inte
 		xtvec = context->csr[CSR_MTVEC];
 		context->csr[CSR_MEPC] = context->pc;
 		context->csr[CSR_MCAUSE] = ncause;
-		context->csr[CSR_MTVAL] = 0; // TODO
+		context->csr[CSR_MTVAL] = xtval;
 		uint32_t nstatus;
 		nstatus  =  context->csr[CSR_MSTATUS] & 0xFFFFE777;
 		nstatus |= (context->mode & 0x3) << 11;
@@ -2403,9 +2815,9 @@ static inline void TakeTrap(uint32_t exec_mode, uint32_t cause, uint32_t is_inte
 		xtvec = context->csr[CSR_STVEC];
 		context->csr[CSR_SEPC] = context->pc;
 		context->csr[CSR_SCAUSE] = ncause;
-		context->csr[CSR_STVAL] = 0; // TODO
+		context->csr[CSR_STVAL] = xtval;
 		uint32_t nstatus;
-		nstatus  =  context->csr[CSR_MSTATUS] & 0xFFFFFE22;
+		nstatus  =  context->csr[CSR_MSTATUS] & 0xFFFFFEDD;
 		nstatus |= (context->mode & 0x1) << 8;
 		nstatus |= (context->csr[CSR_MSTATUS] & 0x2) << 4;
 		context->csr[CSR_MSTATUS] = nstatus;
@@ -2421,12 +2833,14 @@ static inline void TakeTrap(uint32_t exec_mode, uint32_t cause, uint32_t is_inte
 }
 
 int RunLoop(struct cpu_context* context) {
+	/*
 	struct pollfd pfd;
 	pfd.fd = STDIN;
 	pfd.events = POLLIN;
+	*/
 	
 	for (unsigned int i = 0; i < 200000; i++) {
-		
+		/*
 		signed int retval = poll(&pfd, 1, 0);
 		if (retval > 0 && pfd.revents & POLLIN) {
 			unsigned char buf;
@@ -2441,6 +2855,7 @@ int RunLoop(struct cpu_context* context) {
 				}
 			}
 		}
+		*/
 		
 		// Check for interrupts
 		// Update external interrupts
@@ -2459,99 +2874,104 @@ int RunLoop(struct cpu_context* context) {
 				// U-Mode
 				if        (csr_mip & csr_mie & 0x800) {
 					// External M-Mode Interrupt
-					TakeTrap(3, 11, 1, context);
+					TakeTrap(3, 11, 1, 0, context);
 				} else if (csr_mip & csr_mie & 0x008) {
 					// Software M-Mode Interrupt
-					TakeTrap(3, 3, 1, context);
+					TakeTrap(3, 3, 1, 0, context);
 				} else if (csr_mip & csr_mie & 0x080) {
 					// Timer M-Mode Interrupt
-					TakeTrap(3, 7, 1, context);
+					TakeTrap(3, 7, 1, 0, context);
 				} else if (csr_mip & csr_mie & 0x200) {
 					// External S-Mode Interrupt
 					if (csr_mideleg & 0x200) {
-						TakeTrap(1, 9, 1, context);
+						TakeTrap(1, 9, 1, 0, context);
 					} else {
-						TakeTrap(3, 9, 1, context);
+						TakeTrap(3, 9, 1, 0, context);
 					}
 				} else if (csr_mip & csr_mie & 0x002) {
 					// Software S-Mode Interrupt
 					if (csr_mideleg & 0x002) {
-						TakeTrap(1, 1, 1, context);
+						TakeTrap(1, 1, 1, 0, context);
 					} else {
-						TakeTrap(3, 1, 1, context);
+						TakeTrap(3, 1, 1, 0, context);
 					}
 				} else if (csr_mip & csr_mie & 0x020) {
 					// Timer S-Mode Interrupt
 					if (csr_mideleg & 0x020) {
-						TakeTrap(1, 5, 1, context);
+						TakeTrap(1, 5, 1, 0, context);
 					} else {
-						TakeTrap(3, 5, 1, context);
+						TakeTrap(3, 5, 1, 0, context);
 					}
 				}
 			} else if (exec_mode == 1) {
 				// S-Mode
 				if        (csr_mip & csr_mie & 0x800) {
 					// External M-Mode Interrupt
-					TakeTrap(3, 11, 1, context);
+					TakeTrap(3, 11, 1, 0, context);
 				} else if (csr_mip & csr_mie & 0x008) {
 					// Software M-Mode Interrupt
-					TakeTrap(3, 3, 1, context);
+					TakeTrap(3, 3, 1, 0, context);
 				} else if (csr_mip & csr_mie & 0x080) {
 					// Timer M-Mode Interrupt
-					TakeTrap(3, 7, 1, context);
+					TakeTrap(3, 7, 1, 0, context);
 				} else if (csr_mip & csr_mie & 0x200 & ~csr_mideleg) {
 					// External S-Mode Interrupt - Not Delegated
-					TakeTrap(3, 9, 1, context);
+					TakeTrap(3, 9, 1, 0, context);
 				} else if (csr_mip & csr_mie & 0x200 &  csr_mideleg && csr_mstatus & 0x2) {
 					// External S-Mode Interrupt - Delegated
-					TakeTrap(1, 9, 1, context);
+					TakeTrap(1, 9, 1, 0, context);
 				} else if (csr_mip & csr_mie & 0x002 & ~csr_mideleg) {
 					// Software S-Mode Interrupt - Not Delegated
-					TakeTrap(3, 1, 1, context);
+					TakeTrap(3, 1, 1, 0, context);
 				} else if (csr_mip & csr_mie & 0x002 &  csr_mideleg && csr_mstatus & 0x2) {
 					// Software S-Mode Interrupt - Delegated
-					TakeTrap(1, 1, 1, context);
+					TakeTrap(1, 1, 1, 0, context);
 				} else if (csr_mip & csr_mie & 0x020 & ~csr_mideleg) {
 					// Timer S-Mode Interrupt - Not Delegated
-					TakeTrap(3, 5, 1, context);
+					TakeTrap(3, 5, 1, 0, context);
 				} else if (csr_mip & csr_mie & 0x020 &  csr_mideleg && csr_mstatus & 0x2) {
 					// Timer S-Mode Interrupt - Delegated
-					TakeTrap(1, 5, 1, context);
+					//dprintf(1, "<Timer Int> PC: 0x%08X, STVEC: 0x%08X\n", context->pc, context->csr[CSR_STVEC]);
+					TakeTrap(1, 5, 1, 0, context);
 				}
 			} else {
 				// M-Mode
 				if        (csr_mstatus & 0x8) {
 					if        (csr_mip & csr_mie & 0x800) {
 						// External M-Mode Interrupt
-						TakeTrap(3, 11, 1, context);
+						TakeTrap(3, 11, 1, 0, context);
 					} else if (csr_mip & csr_mie & 0x008) {
 						// Software M-Mode Interrupt
-						TakeTrap(3, 3, 1, context);
+						TakeTrap(3, 3, 1, 0, context);
 					} else if (csr_mip & csr_mie & 0x080) {
 						// Timer M-Mode Interrupt
-						TakeTrap(3, 7, 1, context);
+						TakeTrap(3, 7, 1, 0, context);
 					} else if (csr_mip & csr_mie & 0x200 & ~csr_mideleg) {
 						// External S-Mode Interrupt - Not Delegated
-						TakeTrap(3, 9, 1, context);
+						TakeTrap(3, 9, 1, 0, context);
 					} else if (csr_mip & csr_mie & 0x002 & ~csr_mideleg) {
 						// Software S-Mode Interrupt - Not Delegated
-						TakeTrap(3, 1, 1, context);
+						TakeTrap(3, 1, 1, 0, context);
 					} else if (csr_mip & csr_mie & 0x020 & ~csr_mideleg) {
 						// Timer S-Mode Interrupt - Not Delegated
-						TakeTrap(3, 5, 1, context);
+						TakeTrap(3, 5, 1, 0, context);
 					}
 				}
 			}
 		}
 		
+		/*
 		if (debug) {
-			dprintf(STDERR, "DBG PC: 0x%08X\n", context->pc);
+			dprintf(STDERR, "DBG PC: 0x%08X\r\n", context->pc);
 		}
+		*/
 		
 		struct retvals rtn;
 		rtn = ExecMemory(context->pc, context);
 		if (rtn.error == CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
-			rtn.error = ExecuteInstruction(rtn.value, context);
+			rtn = ExecuteInstruction(rtn.value, context);
+		} else {
+			rtn.value = context->pc;
 		}
 		
 		if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
@@ -2565,7 +2985,7 @@ int RunLoop(struct cpu_context* context) {
 				print_reg_state(context);
 			}
 			*/
-			TakeTrap(3, rtn.error, 0, context);
+			TakeTrap(3, rtn.error, 0, rtn.value, context);
 		}
 	}
 	
@@ -2580,7 +3000,7 @@ void InitEmu(struct cpu_context* context) {
 	context->csr[CSR_MISA] = 0x40000000 | (1 << 0) | (1 << 8) | (1 << 18) | (1 << 20);
 	
 	// PLIC Regs
-	plic_source_priorities = 0; //       Offset 0x0000_0000
+	plic_source_priority = 0;
 	plic_pending_array = 0;     //       Offset 0x0000_1000
 	plic_h0_m_inter_en = 0;     // Start Offset 0x0000_2000, Inc: 0x0000_0080
 	plic_h0_s_inter_en = 0;
@@ -2597,6 +3017,7 @@ void InitEmu(struct cpu_context* context) {
 	clint_timeh = 0;
 	clock_gettime(CLOCK_REALTIME, &clint_start_time);
 	
+	/*
 	// UART Regs
 	uart0_txdata = 0;
 	uart0_rxdata = 0;
@@ -2608,12 +3029,31 @@ void InitEmu(struct cpu_context* context) {
 	// Internal
 	uart0_rxcue = 0;
 	uart0_rxcuecount = 0;
+	*/
+	
+	// UART0 Regs
+	uart0_rhr = 0;
+	uart0_thr = 0;
+	uart0_ier = 0;
+	uart0_isr = 0x01;
+	uart0_fcr = 0;
+	uart0_lcr = 0;
+	uart0_mcr = 0x00;
+	uart0_lsr = 0x60;
+	uart0_msr = 0xB0;
+	uart0_spr = 0;
+	uart0_dll = 0x0C;
+	uart0_dlm = 0;
+	uart0_psd = 0;
+	// Internal
+	//uint32_t uart0_rxcue;
+	uart0_rxcuecount = 0;
 	
 	return;
 }
 
 void RunEmulator(struct cpu_context* context) {
-	debug = 0;
+	//debug = 0;
 	int loop = 1;
 	while (loop) {
 		loop = RunLoop(context);
@@ -2685,6 +3125,7 @@ signed int main(unsigned int argc, char *argv[], char *envp[]) {
 	struct cpu_context context;
 	memset(&context, 0, sizeof(struct cpu_context));
 	
+	/*
 	// START: Setup the Terminal
   // Set TTY to Raw mode
   struct termios old_tty_settings;
@@ -2700,10 +3141,15 @@ signed int main(unsigned int argc, char *argv[], char *envp[]) {
     raw_tty_settings.c_cflag |= CS8;
     retval = ioctl(STDIN, TCSETS, &raw_tty_settings);
   }
+  */
 	
 	InitEmu(&context);
 	RunEmulator(&context);
-		
+	
+	/*
+	ioctl(STDIN, TCSETS, &old_tty_settings);
+	*/
+	
 	free(mmdata);
 	free(memory);
 	return 0;
