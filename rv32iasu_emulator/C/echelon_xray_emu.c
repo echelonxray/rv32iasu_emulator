@@ -17,11 +17,29 @@
 #include <time.h>
 #include <unistd.h>
 #include <termios.h>
-#include <poll.h>
+//#include <poll.h>
 
 //#define DEBUG
-//#define DEBUG_Trap
-//#define DEBUG1
+//#define DEBUG_TrapReturn
+
+// Physical Memory-Map Of Emulator:
+// 0x1000_0000: UART
+// 0x2000_0000: Memory-Mapped Data (Filesystem CPIO Image)
+//// 0x3200_0000: CLINT
+//// 0x4000_0000: PLIC
+// 0x0200_0000: CLINT
+// 0x0C00_0000: PLIC
+// 0x8000_0000: RAM
+#define ADDR_RAM_START  0x80000000
+#define ADDR_RAM_LENGTH 0x08000000
+#define ADDR_PLIC_START  0x0C000000
+#define ADDR_PLIC_LENGTH 0x00210000
+#define ADDR_CLINT_START  0x02000000
+#define ADDR_CLINT_LENGTH 0x00010000
+#define ADDR_UART_START  0x10000000
+#define ADDR_UART_LENGTH 0x00001000
+#define ADDR_DATAIMAGE_START  0x20000000
+#define ADDR_DATAIMAGE_LENGTH 0x10000000
 
 #define PLIC_SOURCENUM_UART 10
 
@@ -136,34 +154,10 @@ struct cpu_context {
 	uint32_t csr[20];
 };
 
-// Physical Memory-Map Of Emulator:
-// 0x1000_0000: UART
-// 0x2000_0000: Memory-Mapped Data (Filesystem CPIO Image)
-//// 0x3200_0000: CLINT
-//// 0x4000_0000: PLIC
-// 0x0200_0000: CLINT
-// 0x0C00_0000: PLIC
-// 0x8000_0000: RAM
-#define ADDR_RAM_START  0x80000000
-#define ADDR_RAM_LENGTH 0x08000000
-#define ADDR_PLIC_START  0x0C000000
-#define ADDR_PLIC_LENGTH 0x00210000
-#define ADDR_CLINT_START  0x02000000
-#define ADDR_CLINT_LENGTH 0x00010000
-#define ADDR_UART_START  0x10000000
-#define ADDR_UART_LENGTH 0x00001000
-#define ADDR_DATAIMAGE_START  0x20000000
-#define ADDR_DATAIMAGE_LENGTH 0x10000000
-
 void* mmdata; // 0x2000_0000
 void* memory; // 0x8000_0000
 
 uint32_t mmdata_length; // Should be in 4 byte increments
-/*
-uint32_t tlb_virt;
-uint32_t tlb_phys;
-uint32_t tlb_perm;
-*/
 
 // PLIC Regs
 uint32_t plic_source_priority; //       Offset 0x0000_0000
@@ -201,25 +195,16 @@ uint32_t uart0_psd;
 //uint32_t uart0_rxcue;
 uint32_t uart0_rxcuecount;
 
-//int debug;
-
 void print_reg_state(struct cpu_context *context) {
-	dprintf(STDOUT, "----Print Reg State----\n");
-	dprintf(STDOUT, "\tPC: 0x%08X\n", context->pc);
-	dprintf(STDOUT, "\tMode: %d\n", context->mode);
+	dprintf(STDERR, "----Print Reg State----\n");
+	dprintf(STDERR, "\tPC: 0x%08X\n", context->pc);
+	dprintf(STDERR, "\tMode: %d\n", context->mode);
 	for (int i = 0; i < 32; i += 2) {
-		dprintf(STDOUT, "\tx%02d: 0x%08X, x%02d: 0x%08X\n", i, context->xr[i], i + 1, context->xr[i + 1]);
+		dprintf(STDERR, "\tx%02d: 0x%08X, x%02d: 0x%08X\n", i, context->xr[i], i + 1, context->xr[i + 1]);
 	}
 }
 
 static inline uint32_t ReadPhysMemory(uint32_t addr, unsigned int bitwidth, struct cpu_context *context) {
-#ifdef DEBUG1
-	if (addr == 0x80004f74) {
-		uint32_t* ptr = memory + (addr - 0x80000000);
-		dprintf(STDERR, "read value: %d\n", *ptr);
-	}
-#endif
-	
 	if        (addr >= ADDR_RAM_START && addr < ADDR_RAM_START + ADDR_RAM_LENGTH) {
 		addr -= 0x80000000;
 		if        (bitwidth == 32) {
@@ -284,60 +269,42 @@ static inline uint32_t ReadPhysMemory(uint32_t addr, unsigned int bitwidth, stru
 			if        (addr == 0x00) {
 				// rhr / dll
 				if (uart0_lcr & 0x80) {
-					dprintf(STDERR, "Loa1 Addr: 0x%02X, Value 0x%02X\n", addr, uart0_dll & 0xFF);
 					return uart0_dll;
 				} else {
-					dprintf(STDERR, "Loa0 Addr: 0x%02X, Value 0x%02X\n", addr, uart0_rhr & 0xFF);
 					return uart0_rhr;
 				}
 			} else if (addr == 0x01) {
 				// ier / dlm
 				if (uart0_lcr & 0x80) {
-					dprintf(STDERR, "Loa1 Addr: 0x%02X, Value 0x%02X\n", addr, uart0_dlm & 0xFF);
 					return uart0_dlm;
 				} else {
-					dprintf(STDERR, "Loa0 Addr: 0x%02X, Value 0x%02X\n", addr, uart0_ier & 0xFF);
 					return uart0_ier;
 				}
 			} else if (addr == 0x02) {
 				// isr
-				dprintf(STDERR, "Load Addr: 0x%02X, Value 0x%02X\n", addr, uart0_isr & 0xFF);
 				return uart0_isr;
 			} else if (addr == 0x03) {
 				// lcr
-				dprintf(STDERR, "Load Addr: 0x%02X, Value 0x%02X\n", addr, uart0_lcr & 0xFF);
 				return uart0_lcr;
 			} else if (addr == 0x04) {
 				// mcr
-				dprintf(STDERR, "Load Addr: 0x%02X, Value 0x%02X\n", addr, uart0_mcr & 0xFF);
 				return uart0_mcr;
 			} else if (addr == 0x05) {
 				// lsr
-				dprintf(STDERR, "Load Addr: 0x%02X, Value 0x%02X\n", addr, uart0_lsr & 0xFF);
 				return uart0_lsr;
 			} else if (addr == 0x06) {
 				// msr
-				dprintf(STDERR, "Load Addr: 0x%02X, Value 0x%02X\n", addr, uart0_msr & 0xFF);
 				return uart0_msr;
 			} else if (addr == 0x07) {
 				// spr
-				dprintf(STDERR, "Load Addr: 0x%02X, Value 0x%02X\n", addr, uart0_spr & 0xFF);
 				return uart0_spr;
 			}
-		} else {
-			dprintf(STDOUT, "Read Bitwidth: %d\n", bitwidth);
 		}
 	}
 	return 0;
 }
 
 static inline void SavePhysMemory(uint32_t addr, unsigned int bitwidth, struct cpu_context *context, uint32_t value) {
-#ifdef DEBUG1
-	if (addr == 0x80004f74) {
-		dprintf(STDERR, "save value: %d\n", value);
-	}
-#endif
-	
 	if        (addr >= ADDR_RAM_START && addr < ADDR_RAM_START + ADDR_RAM_LENGTH) {
 		addr -= ADDR_RAM_START;
 		if        (bitwidth == 32) {
@@ -365,7 +332,6 @@ static inline void SavePhysMemory(uint32_t addr, unsigned int bitwidth, struct c
 				plic_h0_m_pri_thres = value & 0x7;
 			} else if (addr == 0x200004) {
 				// h0_m_claim_compl
-				//dprintf(STDOUT, "mclaim: %X\n", value);
 				if (value == PLIC_SOURCENUM_UART) {
 					if (plic_h0_m_inter_en & (1 << value)) {
 						plic_pending_array &= ~(1 << value);
@@ -375,7 +341,6 @@ static inline void SavePhysMemory(uint32_t addr, unsigned int bitwidth, struct c
 				plic_h0_s_pri_thres = value & 0x7;
 			} else if (addr == 0x201004) {
 				// h0_s_claim_compl
-				//dprintf(STDOUT, "sclaim: %X\n", value);
 				if (value == PLIC_SOURCENUM_UART) {
 					if (plic_h0_s_inter_en & (1 << value)) {
 						plic_pending_array &= ~(1 << value);
@@ -400,11 +365,6 @@ static inline void SavePhysMemory(uint32_t addr, unsigned int bitwidth, struct c
 		}
 	} else if (addr >= ADDR_UART_START && addr < ADDR_UART_START + ADDR_UART_LENGTH) {
 		addr -= ADDR_UART_START;
-		/*
-		if (context->mode < 3) {
-			dprintf(STDOUT, "?2");
-		}
-		*/
 		
 		if (bitwidth == 8) {
 			if        (addr == 0x00) {
@@ -412,7 +372,6 @@ static inline void SavePhysMemory(uint32_t addr, unsigned int bitwidth, struct c
 				if (uart0_lcr & 0x80) {
 					// dll
 					uart0_dll = value & 0xFF;
-					dprintf(STDERR, "Sav1 Addr: 0x%02X, Value 0x%02X\n", addr, value & 0xFF);
 				} else {
 					// thr - TX Data
 					dprintf(STDOUT, "%c", value & 0xFF);
@@ -422,65 +381,28 @@ static inline void SavePhysMemory(uint32_t addr, unsigned int bitwidth, struct c
 				if (uart0_lcr & 0x80) {
 					// dlm
 					uart0_dlm = value & 0xFF;
-					dprintf(STDERR, "Sav1 Addr: 0x%02X, Value 0x%02X\n", addr, value & 0xFF);
 				} else {
 					// ier
 					uart0_ier = value & 0x0F;
-					dprintf(STDERR, "Sav0 Addr: 0x%02X, Value 0x%02X\n", addr, value & 0xFF);
 				}
 			} else if (addr == 0x02) {
 				// fcr
 				uart0_fcr = value & 0xC7;
-				dprintf(STDERR, "Save Addr: 0x%02X, Value 0x%02X\n", addr, value & 0xFF);
 			} else if (addr == 0x03) {
 				// lcr
 				uart0_lcr = value & 0xFF;
-				dprintf(STDERR, "Save Addr: 0x%02X, Value 0x%02X\n", addr, value & 0xFF);
 			} else if (addr == 0x04) {
 				// mcr
 				uart0_mcr = value & 0x1F;
-				dprintf(STDERR, "Save Addr: 0x%02X, Value 0x%02X\n", addr, value & 0xFF);
 			} else if (addr == 0x05) {
 				// psd
+				// TODO
 				uart0_psd = value & 0x0F;
-				dprintf(STDERR, "Save Addr: 0x%02X, Value 0x%02X\n", addr, value & 0xFF);
 			} else if (addr == 0x07) {
 				// spr
 				uart0_spr = value & 0xFF;
-				dprintf(STDERR, "Save Addr: 0x%02X, Value 0x%02X\n", addr, value & 0xFF);
 			}
-		} else {
-			dprintf(STDOUT, "Save Bitwidth: %d\n", bitwidth);
 		}
-		
-		//if (bitwidth == 8) {
-		//if (bitwidth == 32) {
-			//if        (addr == 0x00) {
-				// txdata
-				//dprintf(STDOUT, "%c", value);
-			//}
-			/*
-			else if (addr == 0x04) {
-				// rxdata
-				// Do Nothing
-			} else if (addr == 0x08) {
-				// txctrl
-				uart0_txctrl = value & 0x00070003;
-			} else if (addr == 0x0C) {
-				// rxctrl
-				uart0_rxctrl = value & 0x00070001;
-			} else if (addr == 0x10) {
-				// ie
-				uart0_ie = value     & 0x00000003;
-			} else if (addr == 0x14) {
-				// ip
-				// Do Nothing
-			} else if (addr == 0x18) {
-				// div
-				uart0_div = value    & 0x0000FFFF;
-			}
-			*/
-		//}
 	}
 	return;
 }
@@ -493,15 +415,6 @@ static inline struct retvals WalkPTs(uint32_t location, uint32_t csr_satp, uint3
 	
 	// Is Virtual Memory Active?
 	if (page_walk < 0) {
-		/*
-		{
-			uint32 tmploc = location & 0xFFFFF000;
-			tlb_perm
-			if (tlb_virt == tmploc) {
-				return tmploc | tlb_phys;
-			}
-		}
-		*/
 		
 		// Shift to match PTE entry offset to ready for entry to the PT Walk loop
 		page_walk <<= 10;
@@ -906,11 +819,6 @@ static inline void CSR_Write(uint32_t csr_addr, struct cpu_context* context, uin
 	} else if (csr_addr == 0x344) {
 		context->csr[CSR_MIP] = value & 0x00000222;
 	} else if (csr_addr == 0x100) {
-		/*
-		if (debug && value & 0x2) {
-			dprintf(1, "EMU DBG: S-Mode Int Enable (sstatus)\n");
-		}
-		*/
 		context->csr[CSR_MSTATUS] = (context->csr[CSR_MSTATUS] & ~(0x000C0122)) | (value & 0x000C0122); // SSTATUS
 	} else if (csr_addr == 0x104) {
 		context->csr[CSR_MIE] = (context->csr[CSR_MIE] & ~(context->csr[CSR_MIDELEG])) | (value & context->csr[CSR_MIDELEG]); // SIE
@@ -956,7 +864,6 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 #ifdef DEBUG
 		dprintf(STDERR, "\tAUIPC x%d, 0x%08X\n", U_rd(inst), U_imm(inst));
 #endif
-		//dprintf(STDERR, "\tAUIPC x%d, 0x%08X, [0x%08X]\n", U_rd(inst), U_imm(inst), context->pc);
 		
 		if (U_rd(inst) != 0) {
 			RegVal[U_rd(inst)] = U_imm(inst) + context->pc;
@@ -1114,21 +1021,12 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 		} else if (B_funct3(inst) == 0x7) {
 			// Instruction: BGEU
 			
-#ifdef DEBUG1
+#ifdef DEBUG
 			dprintf(STDERR, "\tBGEU x%d, x%d, 0x%08X\n", B_rs1(inst), B_rs2(inst), B_imm(inst));
 #endif
 			
 			uint32_t rs1b = RegVal[B_rs1(inst)];
 			uint32_t rs2b = RegVal[B_rs2(inst)];
-			
-#ifdef DEBUG1
-			dprintf(STDERR, "\trs1b: %d, rs2b: %d, Value: ", rs1b, rs2b);
-			if (rs1b >= rs2b) {
-				dprintf(STDERR, "%d\n", 1);
-			} else {
-				dprintf(STDERR, "%d\n", 0);
-			}
-#endif
 			
 			if (rs1b >= rs2b) {
 				take_branch = 1;
@@ -1242,12 +1140,6 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 			rtn.error = ILLEGAL_INSTRUCTION;
 			return rtn;
 		}
-		
-#ifdef DEBUG1
-		if (offset == 0x80004f74) {
-			dprintf(STDERR, "\tLX offset: 0x%X, rd: %d, I_rd(inst): %d\n", offset, rd, I_rd(inst));
-		}
-#endif
 		
 		if (I_rd(inst) != 0) {
 			RegVal[I_rd(inst)] = rd;
@@ -2347,8 +2239,6 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 			} else if (I_imm(inst) == 1) {
 				// Instruction: EBREAK
 				
-				//debug = 1;
-				
 				if (I_rs1(inst) != 0) {
 					// Invalid Op-code
 					struct retvals rtn;
@@ -2368,9 +2258,6 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				return rtn;
 				*/
 				
-				//debug = 2;
-				//dprintf(1, "TraceA\n");
-				
 			} else if (I_imm(inst) == 0x102) {
 				// Instruction: SRET
 				
@@ -2382,7 +2269,7 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 					return rtn;
 				}
 				
-#if defined(DEBUG) || defined(DEBUG_Trap)
+#if defined(DEBUG) || defined(DEBUG_TrapReturn)
 				dprintf(STDERR, "\tSRET to: 0x%08X\n", context->csr[CSR_SEPC]);
 #endif
 				
@@ -2421,7 +2308,7 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 					return rtn;
 				}
 				
-#if defined(DEBUG) || defined(DEBUG_Trap)
+#if defined(DEBUG) || defined(DEBUG_TrapReturn)
 				dprintf(STDERR, "\tMRET to: 0x%08X with mode: %d\n", context->csr[CSR_MEPC], bits_pp);
 #endif
 				
@@ -2674,10 +2561,6 @@ static inline void UpdateTimer(struct cpu_context* context) {
 	up_time_us *= 1000000;
 	up_time_us += tv_nsec / 1000;
 	
-	//up_time_us /= 1000;
-	
-	//dprintf(STDOUT, "time: %ld\n", up_time_us);
-	
 	clint_time  = (uint32_t)((up_time_us >>  0) & 0xFFFFFFFF);
 	clint_timeh = (uint32_t)((up_time_us >> 32) & 0xFFFFFFFF);
 	
@@ -2781,17 +2664,11 @@ static inline void UpdatePLIC(struct cpu_context* context) {
 }
 
 static inline void TakeTrap(uint32_t exec_mode, uint32_t cause, uint32_t is_interrupt, uint32_t xtval, struct cpu_context* context) {
+	
 #ifdef DEBUG_Trap
 	dprintf(STDERR, "[Trap] pc: 0x%X\n", context->pc);
 #endif
 	
-	//console.log("[Trap]");
-	//console.log(memory);
-	//console.log("last_pc: 0x" + uitoa16(last_pc));
-	//console.log("last_p2: 0x" + uitoa16(last_p2));
-	//console.log("mepc: 0x" + uitoa16(mepc));
-	//print_reg_state();
-	//throw new Error(); // Debug
 	uint32_t xtvec;
 	uint32_t ncause = cause;
 	if (is_interrupt) {
@@ -2846,11 +2723,7 @@ int RunLoop(struct cpu_context* context) {
 			unsigned char buf;
 			retval = read(STDIN, &buf, 1);
 			if (retval > 0) {
-				if        (buf == 'a') {
-					debug = 1;
-				} else if (buf == 's') {
-					debug = 0;
-				} else if (buf == 'd') {
+				if (buf == 'd') {
 					return 0;
 				}
 			}
@@ -2960,12 +2833,6 @@ int RunLoop(struct cpu_context* context) {
 			}
 		}
 		
-		/*
-		if (debug) {
-			dprintf(STDERR, "DBG PC: 0x%08X\r\n", context->pc);
-		}
-		*/
-		
 		struct retvals rtn;
 		rtn = ExecMemory(context->pc, context);
 		if (rtn.error == CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
@@ -2979,14 +2846,9 @@ int RunLoop(struct cpu_context* context) {
 				// TODO WFI
 				break; // Temp Hack
 			}
-			/*
-			if (rtn.error == ILLEGAL_INSTRUCTION) {
-				dprintf(STDOUT, "ILLEGAL_INSTRUCTION\n");
-				print_reg_state(context);
-			}
-			*/
 			TakeTrap(3, rtn.error, 0, rtn.value, context);
 		}
+		
 	}
 	
 	return 1;
@@ -3017,20 +2879,6 @@ void InitEmu(struct cpu_context* context) {
 	clint_timeh = 0;
 	clock_gettime(CLOCK_REALTIME, &clint_start_time);
 	
-	/*
-	// UART Regs
-	uart0_txdata = 0;
-	uart0_rxdata = 0;
-	uart0_txctrl = 0;
-	uart0_rxctrl = 0;
-	uart0_ie = 0;
-	uart0_ip = 0;
-	uart0_div = 0;
-	// Internal
-	uart0_rxcue = 0;
-	uart0_rxcuecount = 0;
-	*/
-	
 	// UART0 Regs
 	uart0_rhr = 0;
 	uart0_thr = 0;
@@ -3053,7 +2901,6 @@ void InitEmu(struct cpu_context* context) {
 }
 
 void RunEmulator(struct cpu_context* context) {
-	//debug = 0;
 	int loop = 1;
 	while (loop) {
 		loop = RunLoop(context);
