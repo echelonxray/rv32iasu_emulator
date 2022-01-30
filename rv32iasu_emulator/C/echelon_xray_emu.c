@@ -6,6 +6,7 @@
  * (C) Copyright 2022 Michael T. Kloos (http://www.michaelkloos.com/).
  * All Rights Reserved.
  */
+#ifndef WASM_BUILD
 
 #include <fcntl.h>
 #include <stdint.h>
@@ -17,10 +18,54 @@
 #include <time.h>
 #include <unistd.h>
 #include <termios.h>
-//#include <poll.h>
+#include <pthread.h>
+#include <poll.h>
+#include <errno.h>
+#include <semaphore.h>
+
+#endif
 
 //#define DEBUG
 //#define DEBUG_TrapReturn
+
+#ifdef WASM_BUILD
+
+typedef unsigned long long uint64_t;
+typedef   signed long long sint64_t;
+typedef   signed long long  int64_t;
+
+typedef unsigned int       uint32_t;
+typedef   signed int       sint32_t;
+typedef   signed int        int32_t;
+
+typedef unsigned short     uint16_t;
+typedef   signed short     sint16_t;
+typedef   signed short      int16_t;
+
+typedef unsigned char       uint8_t;
+typedef   signed char       sint8_t;
+typedef   signed char        int8_t;
+
+typedef uint32_t  size_t;
+typedef sint32_t ssize_t;
+
+#define malloc cust_malloc
+#define memcpy cust_memcpy
+#define memset cust_memset
+
+extern void __heap_base;
+
+#else
+
+typedef  int8_t  sint8_t;
+typedef int16_t sint16_t;
+typedef int32_t sint32_t;
+typedef int64_t sint64_t;
+
+#define thread_lock sem_wait
+#define thread_unlock sem_post
+
+#endif
 
 // Physical Memory-Map Of Emulator:
 // 0x1000_0000: UART
@@ -42,8 +87,6 @@
 #define ADDR_DATAIMAGE_LENGTH 0x10000000
 
 #define PLIC_SOURCENUM_UART 10
-
-typedef int32_t sint32_t;
 
 #define OPCODE(value) (value & 0x7F)
 
@@ -141,6 +184,8 @@ typedef int32_t sint32_t;
 // Placeholder: TIME    // 0xC01
 // Placeholder: TIMEH   // 0xC81
 
+#define UART_RX_FIFO_SIZE 16
+
 struct retvals {
 	uint32_t error;
 	uint32_t value;
@@ -153,6 +198,15 @@ struct cpu_context {
 	uint32_t lr_reserve_set;
 	uint32_t csr[20];
 };
+
+struct cpu_context cpu_cntxt;
+volatile uint32_t running;
+volatile uint32_t running2;
+#ifdef WASM_BUILD
+volatile uint32_t spinlk;
+#else
+sem_t spinlk;
+#endif
 
 void* mmdata; // 0x2000_0000
 void* memory; // 0x8000_0000
@@ -175,11 +229,11 @@ uint32_t clint_mtimecmph;
 // Internal
 uint32_t clint_time;
 uint32_t clint_timeh;
-struct timespec clint_start_time;
+uint64_t clint_start_time64;
 
 // UART0 Regs
-uint32_t uart0_rhr;
-uint32_t uart0_thr;
+//uint32_t uart0_rhr;
+//uint32_t uart0_thr;
 uint32_t uart0_ier;
 uint32_t uart0_isr;
 uint32_t uart0_fcr;
@@ -192,10 +246,58 @@ uint32_t uart0_dll;
 uint32_t uart0_dlm;
 uint32_t uart0_psd;
 // Internal
-//uint32_t uart0_rxcue;
-uint32_t uart0_rxcuecount;
+uint32_t uart0_rxcue[UART_RX_FIFO_SIZE];
+uint32_t uart0_rxcuestoreindex;
+uint32_t uart0_rxcueloadindex;
+volatile uint32_t uart0_rxcuecount;
 
-void print_reg_state(struct cpu_context *context) {
+#ifdef WASM_BUILD
+uint32_t currently_allocated;
+#endif
+
+#ifdef WASM_BUILD
+void terminal_write_char(uint32_t);
+void js_get_timestamp_us(uint64_t*);
+#endif
+
+void uart0_output_char(uint8_t charactor) {
+#ifndef WASM_BUILD
+	dprintf(STDOUT, "%c", charactor);
+#else
+	terminal_write_char(charactor);
+#endif
+	return;
+}
+
+#ifdef WASM_BUILD
+static void* malloc(size_t size) {
+	void* ret = &__heap_base;
+	ret += currently_allocated;
+	currently_allocated += size;
+	return ret;
+}
+static void memcpy(void* dest, void* src, size_t n) {
+	unsigned char* dptr = dest;
+	unsigned char* sptr = src;
+	while (n > 0) {
+		*dptr = *sptr;
+		dptr++;
+		sptr++;
+		n--;
+	}
+	return;
+}
+static void memset(void* s, int c, size_t n) {
+	unsigned char* dptr = s;
+	while (n > 0) {
+		*dptr = (unsigned char)(c & 0xFF);
+		dptr++;
+		n--;
+	}
+	return;
+}
+#else
+static void print_reg_state(struct cpu_context *context) {
 	dprintf(STDERR, "----Print Reg State----\n");
 	dprintf(STDERR, "\tPC: 0x%08X\n", context->pc);
 	dprintf(STDERR, "\tMode: %d\n", context->mode);
@@ -203,6 +305,116 @@ void print_reg_state(struct cpu_context *context) {
 		dprintf(STDERR, "\tx%02d: 0x%08X, x%02d: 0x%08X\n", i, context->xr[i], i + 1, context->xr[i + 1]);
 	}
 }
+static void DestroyEmu() {
+	free(memory);
+	free(mmdata);
+	return;
+}
+#endif
+
+void InitEmu(uint32_t firmware_length, uint32_t disk_image_length) {
+#ifdef WASM_BUILD
+	currently_allocated = 0;
+	spinlk = 0;
+#else
+	sem_init(&spinlk, 0, 1);
+#endif
+	
+	running = 0;
+	running2 = 1;
+	
+	memory = malloc(0x08000000);
+	if (disk_image_length & 0x3) {
+		disk_image_length +=  4;
+		disk_image_length &= -4;
+	}
+	mmdata = malloc(disk_image_length);
+	mmdata_length = disk_image_length;
+	
+	memset(&cpu_cntxt, 0, sizeof(struct cpu_context));
+	cpu_cntxt.pc = 0x80000000;
+	cpu_cntxt.mode = 3;
+	cpu_cntxt.lr_reserve_set = (sint32_t)-1;
+	cpu_cntxt.csr[CSR_MISA] = 0x40000000 | (1 << 0) | (1 << 8) | (1 << 18) | (1 << 20);
+	
+	// PLIC Regs
+	plic_source_priority = 0;
+	plic_pending_array = 0;     //       Offset 0x0000_1000
+	plic_h0_m_inter_en = 0;     // Start Offset 0x0000_2000, Inc: 0x0000_0080
+	plic_h0_s_inter_en = 0;
+	plic_h0_m_pri_thres = 0;    // Start Offset 0x0020_0000, Inc: 0x0000_1000
+	plic_h0_m_claim_compl = 0;  // Start Offset 0x0020_0004, Inc: 0x0000_1000
+	plic_h0_s_pri_thres = 0;
+	plic_h0_s_claim_compl = 0;
+	
+	// CLINT Regs
+	clint_mtimecmp = 0;
+	clint_mtimecmph = 0;
+	// Internal
+	clint_time = 0;
+	clint_timeh = 0;
+
+#ifndef WASM_BUILD
+	struct timespec tm_spc;
+	clock_gettime(CLOCK_REALTIME, &tm_spc);
+	clint_start_time64  = tm_spc.tv_sec * 1000000;
+	clint_start_time64 += tm_spc.tv_nsec / 1000;
+#else
+	js_get_timestamp_us(&clint_start_time64);
+#endif
+
+	// UART0 Regs
+	//uart0_rhr = 0;
+	//uart0_thr = 0;
+	uart0_ier = 0;
+	uart0_isr = 0x01;
+	uart0_fcr = 0;
+	uart0_lcr = 0;
+	uart0_mcr = 0;
+	uart0_lsr = 0x60;
+	uart0_msr = 0;
+	uart0_spr = 0;
+	uart0_dll = 0;
+	uart0_dlm = 0;
+	uart0_psd = 0;
+	// Internal
+	memset(uart0_rxcue, 0, UART_RX_FIFO_SIZE);
+	uart0_rxcuestoreindex = 0;
+	uart0_rxcueloadindex = 0;
+	uart0_rxcuecount = 0;
+	
+	return;
+}
+
+#ifdef WASM_BUILD
+void* get_uart0_rxfifo_circbuf_loc() {
+	return uart0_rxcue;
+}
+uint32_t get_uart0_rxfifo_circbuf_len() {
+	return UART_RX_FIFO_SIZE;
+}
+void* get_uart0_rxfifo_circbuf_index_loc() {
+	return &uart0_rxcuestoreindex;
+}
+void* get_uart0_rxfifo_circbuf_quecount_loc() {
+	return &uart0_rxcuecount;
+}
+void* get_firmware_loc() {
+	return memory;
+}
+void* get_disk_image_loc() {
+	return mmdata;
+}
+void* get_cmp_time_hi_loc() {
+	return &clint_mtimecmph;
+}
+void* get_cmp_time_lo_loc() {
+	return &clint_mtimecmp;
+}
+void* get_running_state_loc() {
+	return (void*)(&running);
+}
+#endif
 
 static inline uint32_t ReadPhysMemory(uint32_t addr, unsigned int bitwidth, struct cpu_context *context) {
 	if        (addr >= ADDR_RAM_START && addr < ADDR_RAM_START + ADDR_RAM_LENGTH) {
@@ -271,7 +483,16 @@ static inline uint32_t ReadPhysMemory(uint32_t addr, unsigned int bitwidth, stru
 				if (uart0_lcr & 0x80) {
 					return uart0_dll;
 				} else {
-					return uart0_rhr;
+					uint32_t cuecount = uart0_rxcuecount;
+					if (cuecount > 0) {
+						uint32_t value = uart0_rxcue[uart0_rxcueloadindex];
+						uart0_rxcueloadindex = (uart0_rxcueloadindex + 1) % UART_RX_FIFO_SIZE;
+						thread_lock(&spinlk);
+						uart0_rxcuecount--;
+						thread_unlock(&spinlk);
+						return value & 0xFF;
+					}
+					return 0;
 				}
 			} else if (addr == 0x01) {
 				// ier / dlm
@@ -374,7 +595,7 @@ static inline void SavePhysMemory(uint32_t addr, unsigned int bitwidth, struct c
 					uart0_dll = value & 0xFF;
 				} else {
 					// thr - TX Data
-					dprintf(STDOUT, "%c", value & 0xFF);
+					uart0_output_char(value & 0xFF);
 				}
 			} else if (addr == 0x01) {
 				// ier / dlm
@@ -2543,23 +2764,18 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 }
 
 static inline void UpdateTimer(struct cpu_context* context) {
+	uint64_t up_time_us;
+	
+#ifdef WASM_BUILD
+	js_get_timestamp_us(&up_time_us);
+#else
 	struct timespec curr_time;
 	clock_gettime(CLOCK_REALTIME, &curr_time);
+	up_time_us  = curr_time.tv_sec  * 1000000;
+	up_time_us += curr_time.tv_nsec / 1000;
+#endif
 	
-	time_t tv_sec  = curr_time.tv_sec - clint_start_time.tv_sec;
-	long   tv_nsec;
-	if (clint_start_time.tv_nsec > curr_time.tv_nsec) {
-		tv_nsec = clint_start_time.tv_nsec - curr_time.tv_nsec;
-		tv_nsec = 1000000000 - tv_nsec;
-		tv_sec--;
-	} else {
-		tv_nsec = curr_time.tv_nsec - clint_start_time.tv_nsec;
-	}
-	
-	uint64_t up_time_us;
-	up_time_us  = tv_sec;
-	up_time_us *= 1000000;
-	up_time_us += tv_nsec / 1000;
+	up_time_us -= clint_start_time64;
 	
 	clint_time  = (uint32_t)((up_time_us >>  0) & 0xFFFFFFFF);
 	clint_timeh = (uint32_t)((up_time_us >> 32) & 0xFFFFFFFF);
@@ -2595,16 +2811,28 @@ static inline void UpdateUART() {
 	
 	// Check for interrupt in order of priority.
 	// Don't worry about error conditions in emulated HW.
-	if        ((uart0_ier & 0x01) &&  (uart0_fcr & 0x1) && (uart0_rxcuecount >= thresh)) {
+	uint32_t cuecount = uart0_rxcuecount;
+	uint32_t timeout_interrupt = 0;
+	if (cuecount > 0) {
+		if (uart0_isr & uart0_lsr & 0x1) {
+			timeout_interrupt = 1;
+		}
+		uart0_lsr |=  0x1;
+	} else {
+		uart0_lsr &= ~0x1;
+	}
+	if        ((uart0_ier & 0x01) &&  (uart0_fcr & 0x1) && (cuecount >= thresh)) {
 		// RX Data Interrupt Enabled
 		// FIFO Enabled.
 		// RX FIFO filled to Threshold
 		uart0_isr = 0x04;
-	} else if ((uart0_ier & 0x01) && !(uart0_fcr & 0x1)) {
+	} else if ((uart0_ier & 0x01) && !(uart0_fcr & 0x1) && (cuecount > 0)) {
 		// RX Data Interrupt Enabled
 		// FIFO Disabled.
 		// Data waiting in RX Buffer Register
 		uart0_isr = 0x04;
+	} else if  (timeout_interrupt) {
+		uart0_isr = 0x0C;
 	} else if  (uart0_ier & 0x02) {
 		// TX Empty Interrupt Enabled
 		// TX FIFO/Buffer Register is clear (Will always be the case in emulated HW)
@@ -2716,7 +2944,7 @@ int RunLoop(struct cpu_context* context) {
 	pfd.events = POLLIN;
 	*/
 	
-	for (unsigned int i = 0; i < 200000; i++) {
+	while (running2) {
 		/*
 		signed int retval = poll(&pfd, 1, 0);
 		if (retval > 0 && pfd.revents & POLLIN) {
@@ -2804,7 +3032,6 @@ int RunLoop(struct cpu_context* context) {
 					TakeTrap(3, 5, 1, 0, context);
 				} else if (csr_mip & csr_mie & 0x020 &  csr_mideleg && csr_mstatus & 0x2) {
 					// Timer S-Mode Interrupt - Delegated
-					//dprintf(1, "<Timer Int> PC: 0x%08X, STVEC: 0x%08X\n", context->pc, context->csr[CSR_STVEC]);
 					TakeTrap(1, 5, 1, 0, context);
 				}
 			} else {
@@ -2844,70 +3071,43 @@ int RunLoop(struct cpu_context* context) {
 		if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
 			if (rtn.error == CUSTOM_INTERNAL_WFI_SLEEP) {
 				// TODO WFI
-				break; // Temp Hack
+				return 1; // Temp Hack
 			}
 			TakeTrap(3, rtn.error, 0, rtn.value, context);
 		}
 		
 	}
 	
-	return 1;
+	return 0;
 }
 
-void InitEmu(struct cpu_context* context) {
-	memset(context, 0, sizeof(struct cpu_context));
-	context->pc = 0x80000000;
-	context->mode = 3;
-	context->lr_reserve_set = (sint32_t)-1;
-	context->csr[CSR_MISA] = 0x40000000 | (1 << 0) | (1 << 8) | (1 << 18) | (1 << 20);
-	
-	// PLIC Regs
-	plic_source_priority = 0;
-	plic_pending_array = 0;     //       Offset 0x0000_1000
-	plic_h0_m_inter_en = 0;     // Start Offset 0x0000_2000, Inc: 0x0000_0080
-	plic_h0_s_inter_en = 0;
-	plic_h0_m_pri_thres = 0;    // Start Offset 0x0020_0000, Inc: 0x0000_1000
-	plic_h0_m_claim_compl = 0;  // Start Offset 0x0020_0004, Inc: 0x0000_1000
-	plic_h0_s_pri_thres = 0;
-	plic_h0_s_claim_compl = 0;
-	
-	// CLINT Regs
-	clint_mtimecmp = 0;
-	clint_mtimecmph = 0;
-	// Internal
-	clint_time = 0;
-	clint_timeh = 0;
-	clock_gettime(CLOCK_REALTIME, &clint_start_time);
-	
-	// UART0 Regs
-	uart0_rhr = 0;
-	uart0_thr = 0;
-	uart0_ier = 0;
-	uart0_isr = 0x01;
-	uart0_fcr = 0;
-	uart0_lcr = 0;
-	uart0_mcr = 0x00;
-	uart0_lsr = 0x60;
-	uart0_msr = 0xB0;
-	uart0_spr = 0;
-	uart0_dll = 0x0C;
-	uart0_dlm = 0;
-	uart0_psd = 0;
-	// Internal
-	//uint32_t uart0_rxcue;
-	uart0_rxcuecount = 0;
-	
-	return;
-}
-
-void RunEmulator(struct cpu_context* context) {
-	int loop = 1;
-	while (loop) {
-		loop = RunLoop(context);
+void* RunEmu(void* ptr) {
+	running = 1;
+	while (running) {
+		running = RunLoop(&cpu_cntxt);
 	}
-	return;
+	return 0;
 }
 
+#ifdef WASM_BUILD
+void thread_lock(volatile uint32_t* spn_lk_ptr) {
+	while (1) {
+		uint32_t spn_lk = *spn_lk_ptr
+		if (spn_lk == 0) {
+			spn_lk = i32.atomic.rmw.cmpxchg(0, 1, spn_lk_ptr);
+			if (spn_lk == 0) {
+				return;
+			}
+		}
+	}
+}
+void thread_unlock(volatile uint32_t* spn_lk_ptr) {
+	*spn_lk_ptr = 0;
+	return;
+}
+#endif
+
+#ifndef WASM_BUILD
 signed int main(unsigned int argc, char *argv[], char *envp[]) {
 	if (argc <= 2) {
 		return 1;
@@ -2918,7 +3118,6 @@ signed int main(unsigned int argc, char *argv[], char *envp[]) {
 	if (fd == -1) {
 		return 2;
 	}
-	
 	signed int ret_val;
 	struct stat statbuf;
 	ret_val = fstat(fd, &statbuf);
@@ -2931,11 +3130,13 @@ signed int main(unsigned int argc, char *argv[], char *envp[]) {
 	if (statbuf.st_size == 0) {
 		return 5;
 	}
-	memory = malloc(0x08000000);
-	ret_val = read(fd, memory, 0x08000000);
+	off_t memory_size;
+	memory_size = statbuf.st_size;
+	void* memory_buf = malloc(memory_size);
+	ret_val = read(fd, memory_buf, memory_size);
 	close(fd);
-	if (ret_val != statbuf.st_size) {
-		free(memory);
+	if (ret_val != memory_size) {
+		free(memory_buf);
 		return 6;
 	}
 	
@@ -2943,7 +3144,6 @@ signed int main(unsigned int argc, char *argv[], char *envp[]) {
 	if (fd == -1) {
 		return 7;
 	}
-	
 	ret_val = fstat(fd, &statbuf);
 	if (ret_val == -1) {
 		return 8;
@@ -2954,25 +3154,17 @@ signed int main(unsigned int argc, char *argv[], char *envp[]) {
 	if (statbuf.st_size == 0) {
 		return 10;
 	}
-	off_t fsize = statbuf.st_size;
-	if (fsize & 0x3) {
-		fsize &= ~((off_t)0x3);
-		fsize += 0x4;
-	}
-	mmdata_length = fsize;
-	mmdata = malloc(fsize);
-	ret_val = read(fd, mmdata, statbuf.st_size);
+	off_t mmdata_size;
+	mmdata_size = statbuf.st_size;
+	void* mmdata_buf = malloc(mmdata_size);
+	ret_val = read(fd, mmdata_buf, mmdata_size);
 	close(fd);
-	if (ret_val != statbuf.st_size) {
-		free(mmdata);
-		free(memory);
+	if (ret_val != mmdata_size) {
+		free(mmdata_buf);
+		free(memory_buf);
 		return 11;
 	}
 	
-	struct cpu_context context;
-	memset(&context, 0, sizeof(struct cpu_context));
-	
-	/*
 	// START: Setup the Terminal
   // Set TTY to Raw mode
   struct termios old_tty_settings;
@@ -2988,16 +3180,58 @@ signed int main(unsigned int argc, char *argv[], char *envp[]) {
     raw_tty_settings.c_cflag |= CS8;
     retval = ioctl(STDIN, TCSETS, &raw_tty_settings);
   }
-  */
 	
-	InitEmu(&context);
-	RunEmulator(&context);
+	InitEmu(memory_size, mmdata_size);
 	
-	/*
+	memcpy(memory, memory_buf, memory_size);
+	memcpy(mmdata, mmdata_buf, mmdata_size);
+	free(memory_buf);
+	free(mmdata_buf);
+	
+	pthread_t thread;
+	pthread_create(&thread, NULL, RunEmu, NULL);
+	
+	int loop = 1;
+	struct pollfd pfd;
+	pfd.fd = STDIN;
+	pfd.events = POLLIN;
+	pfd.revents = 0;
+	do {
+		do {
+			ret_val = poll(&pfd, 1, 5000);
+		} while (ret_val < 0);
+		
+		if (pfd.revents & POLLIN) {
+			char val;
+			ret_val = read(STDIN, &val, 1);
+			if (ret_val <= 0) {
+				if (ret_val == EINTR) {
+					continue;
+				}
+				dprintf(STDERR, "Read Error\n\r");
+				loop = 0;
+				running2 = 0;
+				break;
+			}
+			if (val == '~') {
+				loop = 0;
+				running2 = 0;
+			}
+			uart0_rxcue[uart0_rxcuestoreindex] = val;
+			uart0_rxcuestoreindex = (uart0_rxcuestoreindex + 1) % UART_RX_FIFO_SIZE;
+			thread_lock(&spinlk);
+			if (uart0_rxcuecount < UART_RX_FIFO_SIZE) {
+				uart0_rxcuecount++;
+			}
+			thread_unlock(&spinlk);
+		}
+	} while (loop);
+	pthread_join(thread, NULL);
+	
 	ioctl(STDIN, TCSETS, &old_tty_settings);
-	*/
 	
-	free(mmdata);
-	free(memory);
+	DestroyEmu();
+	
 	return 0;
 }
+#endif
