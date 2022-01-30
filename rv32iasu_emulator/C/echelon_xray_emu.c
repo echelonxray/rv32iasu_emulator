@@ -1,11 +1,12 @@
 /*
- * Name: RV32IASU Emulator in C
+ * Name: RV32IASU Emulator Core Layer C-Half in C
  * Author: Michael T. Kloos
  * 
  * Copyright: 
  * (C) Copyright 2022 Michael T. Kloos (http://www.michaelkloos.com/).
  * All Rights Reserved.
  */
+
 #ifndef WASM_BUILD
 
 #include <fcntl.h>
@@ -201,7 +202,6 @@ struct cpu_context {
 
 struct cpu_context cpu_cntxt;
 volatile uint32_t running;
-volatile uint32_t running2;
 #ifdef WASM_BUILD
 volatile uint32_t spinlk;
 #else
@@ -251,11 +251,14 @@ uint32_t uart0_rxcuestoreindex;
 uint32_t uart0_rxcueloadindex;
 volatile uint32_t uart0_rxcuecount;
 
+static inline void UpdateTimer(struct cpu_context* context); // TODO: Remove
+
 #ifdef WASM_BUILD
 uint32_t currently_allocated;
 #endif
 
 #ifdef WASM_BUILD
+void console_log(uint32_t);
 void terminal_write_char(uint32_t);
 void js_get_timestamp_us(uint64_t*);
 #endif
@@ -296,6 +299,21 @@ static void memset(void* s, int c, size_t n) {
 	}
 	return;
 }
+void thread_lock(volatile uint32_t* spn_lk_ptr) {
+	while (1) {
+		uint32_t spn_lk = *spn_lk_ptr;
+		if (spn_lk == 0) {
+			spn_lk = __atomic_exchange_n(spn_lk_ptr, 1, __ATOMIC_SEQ_CST);
+			if (spn_lk == 0) {
+				return;
+			}
+		}
+	}
+}
+void thread_unlock(volatile uint32_t* spn_lk_ptr) {
+	*spn_lk_ptr = 0;
+	return;
+}
 #else
 static void print_reg_state(struct cpu_context *context) {
 	dprintf(STDERR, "----Print Reg State----\n");
@@ -321,7 +339,6 @@ void InitEmu(uint32_t firmware_length, uint32_t disk_image_length) {
 #endif
 	
 	running = 0;
-	running2 = 1;
 	
 	memory = malloc(0x08000000);
 	if (disk_image_length & 0x3) {
@@ -397,7 +414,7 @@ void* get_uart0_rxfifo_circbuf_index_loc() {
 	return &uart0_rxcuestoreindex;
 }
 void* get_uart0_rxfifo_circbuf_quecount_loc() {
-	return &uart0_rxcuecount;
+	return (void*)&uart0_rxcuecount;
 }
 void* get_firmware_loc() {
 	return memory;
@@ -411,8 +428,19 @@ void* get_cmp_time_hi_loc() {
 void* get_cmp_time_lo_loc() {
 	return &clint_mtimecmp;
 }
+void* get_start_time_hi_loc() {
+	void* ptr = &clint_start_time64;
+	return ptr + 4;
+}
+void* get_start_time_lo_loc() {
+	void* ptr = &clint_start_time64;
+	return ptr;
+}
 void* get_running_state_loc() {
-	return (void*)(&running);
+	return (void*)&running;
+}
+void* get_lock_loc() {
+	return (void*)&spinlk;
 }
 #endif
 
@@ -999,8 +1027,10 @@ static inline struct retvals CSR_Read(uint32_t csr_addr, struct cpu_context* con
 	} else if (csr_addr == 0x180) {
 		rtn.value = context->csr[CSR_SATP];
 	} else if (csr_addr == 0xC01) {
+		UpdateTimer(context);
 		rtn.value = clint_time;
 	} else if (csr_addr == 0xC81) {
+		UpdateTimer(context);
 		rtn.value = clint_timeh;
 	} else {
 		// CSR Does Not Exist
@@ -2944,7 +2974,8 @@ int RunLoop(struct cpu_context* context) {
 	pfd.events = POLLIN;
 	*/
 	
-	while (running2) {
+	unsigned int i = 0;
+	while (running) {
 		/*
 		signed int retval = poll(&pfd, 1, 0);
 		if (retval > 0 && pfd.revents & POLLIN) {
@@ -2962,7 +2993,12 @@ int RunLoop(struct cpu_context* context) {
 		// Update external interrupts
 		UpdatePLIC(context);
 		// Update timer interrupts
-		UpdateTimer(context);
+		if (i == 1000) {
+			UpdateTimer(context);
+			i = 0;
+		} else {
+			i++;
+		}
 		
 		// Fire interrupts
 		{
@@ -3070,8 +3106,12 @@ int RunLoop(struct cpu_context* context) {
 		
 		if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
 			if (rtn.error == CUSTOM_INTERNAL_WFI_SLEEP) {
-				// TODO WFI
-				return 1; // Temp Hack
+				// WFI
+#ifdef WASM_BUILD
+				return 1;
+#else
+				continue; // TODO: WFI for native
+#endif
 			}
 			TakeTrap(3, rtn.error, 0, rtn.value, context);
 		}
@@ -3083,29 +3123,19 @@ int RunLoop(struct cpu_context* context) {
 
 void* RunEmu(void* ptr) {
 	running = 1;
-	while (running) {
-		running = RunLoop(&cpu_cntxt);
+	RunLoop(&cpu_cntxt);
+	thread_lock(&spinlk);
+	running = 0;
+	UpdatePLIC(&cpu_cntxt);
+	UpdateTimer(&cpu_cntxt);
+	uint32_t retval = 0; 
+	if (cpu_cntxt.csr[CSR_MIP] & cpu_cntxt.csr[CSR_MIE]) {
+		retval = 0x10000;
 	}
-	return 0;
+	retval |= cpu_cntxt.csr[CSR_MIE];
+	thread_unlock(&spinlk);
+	return (void*)((unsigned long)retval);
 }
-
-#ifdef WASM_BUILD
-void thread_lock(volatile uint32_t* spn_lk_ptr) {
-	while (1) {
-		uint32_t spn_lk = *spn_lk_ptr
-		if (spn_lk == 0) {
-			spn_lk = i32.atomic.rmw.cmpxchg(0, 1, spn_lk_ptr);
-			if (spn_lk == 0) {
-				return;
-			}
-		}
-	}
-}
-void thread_unlock(volatile uint32_t* spn_lk_ptr) {
-	*spn_lk_ptr = 0;
-	return;
-}
-#endif
 
 #ifndef WASM_BUILD
 signed int main(unsigned int argc, char *argv[], char *envp[]) {
@@ -3210,17 +3240,17 @@ signed int main(unsigned int argc, char *argv[], char *envp[]) {
 				}
 				dprintf(STDERR, "Read Error\n\r");
 				loop = 0;
-				running2 = 0;
+				running = 0;
 				break;
 			}
 			if (val == '~') {
 				loop = 0;
-				running2 = 0;
+				running = 0;
 			}
-			uart0_rxcue[uart0_rxcuestoreindex] = val;
-			uart0_rxcuestoreindex = (uart0_rxcuestoreindex + 1) % UART_RX_FIFO_SIZE;
 			thread_lock(&spinlk);
 			if (uart0_rxcuecount < UART_RX_FIFO_SIZE) {
+				uart0_rxcue[uart0_rxcuestoreindex] = val;
+				uart0_rxcuestoreindex = (uart0_rxcuestoreindex + 1) % UART_RX_FIFO_SIZE;
 				uart0_rxcuecount++;
 			}
 			thread_unlock(&spinlk);
