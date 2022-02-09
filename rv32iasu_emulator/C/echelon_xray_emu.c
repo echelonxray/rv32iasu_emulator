@@ -1,8 +1,8 @@
 /*
  * Name: RV32IASU Emulator Core Layer C-Half in C
  * Author: Michael T. Kloos
- * 
- * Copyright: 
+ *
+ * Copyright:
  * (C) Copyright 2022 Michael T. Kloos (http://www.michaelkloos.com/).
  * All Rights Reserved.
  */

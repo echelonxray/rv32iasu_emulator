@@ -1,3 +1,12 @@
+/*
+ * Name: Snake in C
+ * Author: Michael T. Kloos
+ *
+ * Copyright:
+ * (C) Copyright 2022 Michael T. Kloos (http://www.michaelkloos.com/).
+ * All Rights Reserved.
+ */
+
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
