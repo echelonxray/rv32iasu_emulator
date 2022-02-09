@@ -2,7 +2,7 @@ TUPLE         := x86_64-pc-linux-gnu-
 CC            := $(TUPLE)gcc
 OBJCPY        := $(TUPLE)objcopy
 STRIP         := $(TUPLE)strip
-CFLAGS        := -Wall -Wextra -std=c99 -O3 -march=native -g
+CFLAGS        := -Wall -Wextra -std=c99 -O3 -march=native
 LDFLAGS       := -pthread
 DEFINES       := -D _POSIX_C_SOURCE=200809L
 

@@ -7,7 +7,15 @@
  * All Rights Reserved.
  */
 
+/*
+ * Configuration Definitions:
+ *   DEBUG
+ *   WASM_BUILD
+ */
+
 #ifndef WASM_BUILD
+
+#define _POSIX_C_SOURCE 200809L
 
 #include <fcntl.h>
 #include <stdint.h>
@@ -23,11 +31,9 @@
 #include <poll.h>
 #include <errno.h>
 #include <semaphore.h>
+#include <signal.h>
 
 #endif
-
-//#define DEBUG
-//#define DEBUG_TrapReturn
 
 #ifdef WASM_BUILD
 
@@ -65,6 +71,8 @@ typedef int64_t sint64_t;
 
 #define thread_lock sem_wait
 #define thread_unlock sem_post
+
+#define EXTERN_INT_SIG (SIGRTMIN + 0)
 
 #endif
 
@@ -253,6 +261,17 @@ volatile uint32_t uart0_rxcuecount;
 
 static inline void UpdateTimer(struct cpu_context* context); // TODO: Remove
 
+#ifdef DEBUG
+volatile signed int debug;
+volatile signed int debug_trap;
+volatile signed int debug_trapret;
+volatile signed int debug_timeint;
+volatile signed int debug_pagead;
+volatile signed int debug_memaccess;
+
+uint32_t debugP_addr = 0x00000000;
+#endif
+
 #ifdef WASM_BUILD
 uint32_t currently_allocated;
 #endif
@@ -315,14 +334,16 @@ void thread_unlock(volatile uint32_t* spn_lk_ptr) {
 	return;
 }
 #else
-static void print_reg_state(struct cpu_context *context) {
-	dprintf(STDERR, "----Print Reg State----\n");
-	dprintf(STDERR, "\tPC: 0x%08X\n", context->pc);
-	dprintf(STDERR, "\tMode: %d\n", context->mode);
+#ifdef DEBUG
+static void print_reg_state(struct cpu_context *context, uint32_t data) {
+	dprintf(STDERR, "PC: 0x%08X, Data: 0x%08X\n\r", context->pc, data);
+	dprintf(STDERR, "\tMode: %d\n\r", context->mode);
 	for (int i = 0; i < 32; i += 2) {
-		dprintf(STDERR, "\tx%02d: 0x%08X, x%02d: 0x%08X\n", i, context->xr[i], i + 1, context->xr[i + 1]);
+		dprintf(STDERR, "\tx%02d: 0x%08X, x%02d: 0x%08X\n\r", i, context->xr[i], i + 1, context->xr[i + 1]);
 	}
+	return;
 }
+#endif
 static void DestroyEmu() {
 	free(memory);
 	free(mmdata);
@@ -336,6 +357,15 @@ void InitEmu(uint32_t firmware_length, uint32_t disk_image_length) {
 	spinlk = 0;
 #else
 	sem_init(&spinlk, 0, 1);
+#endif
+	
+#ifdef DEBUG
+	debug = 0;
+	debug_trap = 0;
+	debug_trapret = 0;
+	debug_timeint = 1;
+	debug_pagead = 0;
+	debug_memaccess = 0;
 #endif
 	
 	running = 0;
@@ -383,19 +413,19 @@ void InitEmu(uint32_t firmware_length, uint32_t disk_image_length) {
 	// UART0 Regs
 	//uart0_rhr = 0;
 	//uart0_thr = 0;
-	uart0_ier = 0;
+	uart0_ier = 0x00;
 	uart0_isr = 0x01;
-	uart0_fcr = 0;
-	uart0_lcr = 0;
-	uart0_mcr = 0;
+	uart0_fcr = 0x00;
+	uart0_lcr = 0x00;
+	uart0_mcr = 0x08;
 	uart0_lsr = 0x60;
-	uart0_msr = 0;
-	uart0_spr = 0;
-	uart0_dll = 0;
-	uart0_dlm = 0;
-	uart0_psd = 0;
+	uart0_msr = 0xB0;
+	uart0_spr = 0x00;
+	uart0_dll = 0x00;
+	uart0_dlm = 0x00;
+	uart0_psd = 0x00;
 	// Internal
-	memset(uart0_rxcue, 0, UART_RX_FIFO_SIZE);
+	memset(uart0_rxcue, 0, sizeof(uint32_t) * UART_RX_FIFO_SIZE);
 	uart0_rxcuestoreindex = 0;
 	uart0_rxcueloadindex = 0;
 	uart0_rxcuecount = 0;
@@ -669,6 +699,7 @@ static inline struct retvals WalkPTs(uint32_t location, uint32_t csr_satp, uint3
 		page_walk <<= 10;
 		
 		// Walk the PTs
+		uint32_t entry_next_pt_location;
 		sint32_t shift_ammount = 10 + 12 - 2;
 		do {
 			// Correct Offset: Left Shift and then Right Arithmetic Shift for Sign Extension
@@ -676,7 +707,6 @@ static inline struct retvals WalkPTs(uint32_t location, uint32_t csr_satp, uint3
 			page_walk >>= 0;
 			
 			// Find the location of the next entry from the next page
-			uint32_t entry_next_pt_location;
 			entry_next_pt_location  =                  page_walk  & ~((uint32_t)0xFFF);
 			entry_next_pt_location |= (location >> shift_ammount) &             0xFFC;
 			
@@ -685,6 +715,8 @@ static inline struct retvals WalkPTs(uint32_t location, uint32_t csr_satp, uint3
 			
 			shift_ammount -= 10;
 		} while ((page_walk & 0xF) == 1 && shift_ammount >= (12 - 2));
+		
+		uint32_t page_walk2 = page_walk;
 		
 		// Not a leaf PTE?
 		if ((page_walk & 0xF) == 0x1) {
@@ -803,11 +835,21 @@ static inline struct retvals WalkPTs(uint32_t location, uint32_t csr_satp, uint3
 		// Check Page Accessed and Page Dirty BitFlags
 		if ((page_walk & 0x40) == 0) {
 			// pte.a == 0
+#ifdef DEBUG
+			if (debug_pagead) {
+				dprintf(STDERR, "Page Accessed\n\r");
+			}
+#endif
 			
+			page_walk2 |= 0x40;
+			SavePhysMemory(entry_next_pt_location, 32, context, page_walk2);
+			
+			/*
 			struct retvals rtn;
 			rtn.value = 0;
 			rtn.error = 1; // Page Fault
 			return rtn;
+			*/
 		}
 		if ((page_walk & 0x80) == 0) {
 			// pte.d == 0
@@ -815,10 +857,21 @@ static inline struct retvals WalkPTs(uint32_t location, uint32_t csr_satp, uint3
 			if (access_type == 1) {
 				// Write
 				
+#ifdef DEBUG
+				if (debug_pagead) {
+					dprintf(STDERR, "Page Dirty\n\r");
+				}
+#endif
+				
+				page_walk2 |= 0x80;
+				SavePhysMemory(entry_next_pt_location, 32, context, page_walk2);
+				
+				/*
 				struct retvals rtn;
 				rtn.value = 0;
 				rtn.error = 1; // Page Fault
 				return rtn;
+				*/
 			}
 		}
 		
@@ -862,6 +915,11 @@ static inline struct retvals ExecMemory(uint32_t addr, struct cpu_context *conte
 }
 
 static inline struct retvals ReadMemory(uint32_t addr, unsigned int bitwidth, struct cpu_context *context) {
+	
+#ifdef DEBUG
+	uint32_t addr2 = addr;
+#endif
+	
 	if        (bitwidth == 32) {
 		if (addr & 0x3) {
 			struct retvals rtn;
@@ -891,6 +949,14 @@ static inline struct retvals ReadMemory(uint32_t addr, unsigned int bitwidth, st
 	
 	uint32_t value = ReadPhysMemory(addr, bitwidth, context);
 	
+#ifdef DEBUG
+	if (debug_memaccess) {
+		if ((addr2 & -3) == debugP_addr) {
+			dprintf(STDERR, "[Memory Access] PC: 0x%08X, Load Virt Addr: 0x%08X, Phys Addr: 0x%08X, Value: 0x%08X\n\r", context->pc, addr2, addr, value);
+		}
+	}
+#endif
+	
 	struct retvals rtn;
 	rtn.error = CUSTOM_INTERNAL_EXECUTION_SUCCESS;
 	rtn.value = value;
@@ -898,6 +964,11 @@ static inline struct retvals ReadMemory(uint32_t addr, unsigned int bitwidth, st
 }
 
 static inline struct retvals SaveMemory(uint32_t addr, unsigned int bitwidth, struct cpu_context *context, uint32_t value) {
+	
+#ifdef DEBUG
+	uint32_t addr2 = addr;
+#endif
+	
 	if        (bitwidth == 32) {
 		if (addr & 0x3) {
 			struct retvals rtn;
@@ -928,6 +999,14 @@ static inline struct retvals SaveMemory(uint32_t addr, unsigned int bitwidth, st
 	if (context->lr_reserve_set == (addr & ~((uint32_t)0x3))) {
 		context->lr_reserve_set = (sint32_t)-1;
 	}
+	
+#ifdef DEBUG
+	if (debug_memaccess) {
+		if ((addr2 & -3) == debugP_addr) {
+			dprintf(STDERR, "[Memory Access] PC: 0x%08X, Save Virt Addr: 0x%08X, Phys Addr: 0x%08X, Value: 0x%08X\n\r", context->pc, addr2, addr, value);
+		}
+	}
+#endif
 	
 	SavePhysMemory(addr, bitwidth, context, value);
 	
@@ -1096,24 +1175,33 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 	// Execute Instruction
 	
 #ifdef DEBUG
-	dprintf(STDERR, "PC: 0x%08X, DATA: 0x%08X, OPCODE: 0x%08X\n", context->pc, inst, OPCODE(inst));
+	if (debug) {
+		print_reg_state(context, inst);
+		//dprintf(STDERR, "PC: 0x%08X, DATA: 0x%08X, OPCODE: 0x%08X\n\r", context->pc, inst, OPCODE(inst));
+	}
 #endif
 	
 	if (OPCODE(inst) == 0x37) {
 		// Instruction: LUI
 		// U-type
+		
 #ifdef DEBUG
-		dprintf(STDERR, "\tLUI x%d, 0x%08X\n", U_rd(inst), U_imm(inst));
+		if (debug) {
+			dprintf(STDERR, "\tLUI x%d, 0x%08X\n\r", U_rd(inst), U_imm(inst));
+		}
 #endif
 		if (U_rd(inst) != 0) {
 			RegVal[U_rd(inst)] = U_imm(inst);
 		}
+		
 	} else if (OPCODE(inst) == 0x17) {
 		// Instruction: AUIPC
 		// U-type
 		
 #ifdef DEBUG
-		dprintf(STDERR, "\tAUIPC x%d, 0x%08X\n", U_rd(inst), U_imm(inst));
+		if (debug) {
+			dprintf(STDERR, "\tAUIPC x%d, 0x%08X\n\r", U_rd(inst), U_imm(inst));
+		}
 #endif
 		
 		if (U_rd(inst) != 0) {
@@ -1125,7 +1213,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 		// J-type
 		
 #ifdef DEBUG
-		dprintf(STDERR, "\tJAL x%d, 0x%08X\n", J_rd(inst), J_imm(inst));
+		if (debug) {
+			dprintf(STDERR, "\tJAL x%d, 0x%08X\n\r", J_rd(inst), J_imm(inst));
+		}
 #endif
 		
 		uint32_t offset = J_imm(inst);
@@ -1158,7 +1248,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 			// Instruction: JALR
 			
 #ifdef DEBUG
-			dprintf(STDERR, "\tJALR x%d, 0x%03X(x%d)\n", I_rd(inst), I_imm(inst), I_rs1(inst));
+			if (debug) {
+				dprintf(STDERR, "\tJALR x%d, 0x%03X(x%d)\n\r", I_rd(inst), I_imm(inst), I_rs1(inst));
+			}
 #endif
 			
 			uint32_t offset = I_imm(inst);
@@ -1208,7 +1300,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 			// Instruction: BEQ
 			
 #ifdef DEBUG
-			dprintf(STDERR, "\tBEQ x%d, x%d, 0x%08X\n", B_rs1(inst), B_rs2(inst), B_imm(inst));
+			if (debug) {
+				dprintf(STDERR, "\tBEQ x%d, x%d, 0x%08X\n\r", B_rs1(inst), B_rs2(inst), B_imm(inst));
+			}
 #endif
 			
 			uint32_t rs1b = RegVal[B_rs1(inst)];
@@ -1221,7 +1315,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 			// Instruction: BNE
 			
 #ifdef DEBUG
-			dprintf(STDERR, "\tBNE x%d, x%d, 0x%08X\n", B_rs1(inst), B_rs2(inst), B_imm(inst));
+			if (debug) {
+				dprintf(STDERR, "\tBNE x%d, x%d, 0x%08X\n\r", B_rs1(inst), B_rs2(inst), B_imm(inst));
+			}
 #endif
 			
 			uint32_t rs1b = RegVal[B_rs1(inst)];
@@ -1234,7 +1330,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 			// Instruction: BLT
 			
 #ifdef DEBUG
-			dprintf(STDERR, "\tBLT x%d, x%d, 0x%08X\n", B_rs1(inst), B_rs2(inst), B_imm(inst));
+			if (debug) {
+				dprintf(STDERR, "\tBLT x%d, x%d, 0x%08X\n\r", B_rs1(inst), B_rs2(inst), B_imm(inst));
+			}
 #endif
 			
 			sint32_t rs1b = RegVal[B_rs1(inst)];
@@ -1247,7 +1345,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 			// Instruction: BGE
 			
 #ifdef DEBUG
-			dprintf(STDERR, "\tBGE x%d, x%d, 0x%08X\n", B_rs1(inst), B_rs2(inst), B_imm(inst));
+			if (debug) {
+				dprintf(STDERR, "\tBGE x%d, x%d, 0x%08X\n\r", B_rs1(inst), B_rs2(inst), B_imm(inst));
+			}
 #endif
 			
 			sint32_t rs1b = RegVal[B_rs1(inst)];
@@ -1260,7 +1360,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 			// Instruction: BLTU
 			
 #ifdef DEBUG
-			dprintf(STDERR, "\tBLTU x%d, x%d, 0x%08X\n", B_rs1(inst), B_rs2(inst), B_imm(inst));
+			if (debug) {
+				dprintf(STDERR, "\tBLTU x%d, x%d, 0x%08X\n\r", B_rs1(inst), B_rs2(inst), B_imm(inst));
+			}
 #endif
 			
 			uint32_t rs1b = RegVal[B_rs1(inst)];
@@ -1273,7 +1375,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 			// Instruction: BGEU
 			
 #ifdef DEBUG
-			dprintf(STDERR, "\tBGEU x%d, x%d, 0x%08X\n", B_rs1(inst), B_rs2(inst), B_imm(inst));
+			if (debug) {
+				dprintf(STDERR, "\tBGEU x%d, x%d, 0x%08X\n\r", B_rs1(inst), B_rs2(inst), B_imm(inst));
+			}
 #endif
 			
 			uint32_t rs1b = RegVal[B_rs1(inst)];
@@ -1323,12 +1427,14 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 			// Instruction: LB
 			
 #ifdef DEBUG
-			if (I_funct3(inst) & 0x4) {
-				dprintf(STDERR, "\tLBU");
-			} else {
-				dprintf(STDERR, "\tLB");
+			if (debug) {
+				if (I_funct3(inst) & 0x4) {
+					dprintf(STDERR, "\tLBU");
+				} else {
+					dprintf(STDERR, "\tLB");
+				}
+				dprintf(STDERR, " x%d, x%d, 0x%08X\n\r", I_rd(inst), I_rs1(inst), I_imm(inst));
 			}
-			dprintf(STDERR, " x%d, x%d, 0x%08X\n", I_rd(inst), I_rs1(inst), I_imm(inst));
 #endif
 			
 			struct retvals rtn;
@@ -1348,12 +1454,14 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 			// Instruction: LH
 			
 #ifdef DEBUG
-			if (I_funct3(inst) & 0x4) {
-				dprintf(STDERR, "\tLHU");
-			} else {
-				dprintf(STDERR, "\tLH");
+			if (debug) {
+				if (I_funct3(inst) & 0x4) {
+					dprintf(STDERR, "\tLHU");
+				} else {
+					dprintf(STDERR, "\tLH");
+				}
+				dprintf(STDERR, " x%d, x%d, 0x%08X\n\r", I_rd(inst), I_rs1(inst), I_imm(inst));
 			}
-			dprintf(STDERR, " x%d, x%d, 0x%08X\n", I_rd(inst), I_rs1(inst), I_imm(inst));
 #endif
 			
 			struct retvals rtn;
@@ -1373,7 +1481,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 			// Instruction: LW
 			
 #ifdef DEBUG
-			dprintf(STDERR, "\tLW x%d, x%d, 0x%08X\n", I_rd(inst), I_rs1(inst), I_imm(inst));
+			if (debug) {
+				dprintf(STDERR, "\tLW x%d, x%d, 0x%08X\n\r", I_rd(inst), I_rs1(inst), I_imm(inst));
+			}
 #endif
 			
 			struct retvals rtn;
@@ -1412,7 +1522,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 			// Instruction: SB
 			
 #ifdef DEBUG
-			dprintf(STDERR, "\tSB x%d, x%d, 0x%08X\n", S_rs1(inst), S_rs2(inst), S_imm(inst));
+			if (debug) {
+				dprintf(STDERR, "\tSB x%d, x%d, 0x%08X\n\r", S_rs1(inst), S_rs2(inst), S_imm(inst));
+			}
 #endif
 			
 			struct retvals rtn;
@@ -1426,7 +1538,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 			// Instruction: SH
 			
 #ifdef DEBUG
-			dprintf(STDERR, "\tSH x%d, x%d, 0x%08X\n", S_rs1(inst), S_rs2(inst), S_imm(inst));
+			if (debug) {
+				dprintf(STDERR, "\tSH x%d, x%d, 0x%08X\n\r", S_rs1(inst), S_rs2(inst), S_imm(inst));
+			}
 #endif
 			
 			struct retvals rtn;
@@ -1440,7 +1554,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 			// Instruction: SW
 			
 #ifdef DEBUG
-			dprintf(STDERR, "\tSW x%d, x%d, 0x%08X\n", S_rs1(inst), S_rs2(inst), S_imm(inst));
+			if (debug) {
+				dprintf(STDERR, "\tSW x%d, x%d, 0x%08X\n\r", S_rs1(inst), S_rs2(inst), S_imm(inst));
+			}
 #endif
 			
 			struct retvals rtn;
@@ -1474,7 +1590,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 			// Instruction: ADDI
 			
 #ifdef DEBUG
-			dprintf(STDERR, "\tADDI x%d, x%d, 0x%08X\n", I_rd(inst), I_rs1(inst), I_imm(inst));
+			if (debug) {
+				dprintf(STDERR, "\tADDI x%d, x%d, 0x%08X\n\r", I_rd(inst), I_rs1(inst), I_imm(inst));
+			}
 #endif
 			
 			uint32_t rs1b = RegVal[I_rs1(inst)];
@@ -1485,7 +1603,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 			// Instruction: SLTI
 			
 #ifdef DEBUG
-			dprintf(STDERR, "\tSLTI x%d, x%d, 0x%08X\n", I_rd(inst), I_rs1(inst), I_imm(inst));
+			if (debug) {
+				dprintf(STDERR, "\tSLTI x%d, x%d, 0x%08X\n\r", I_rd(inst), I_rs1(inst), I_imm(inst));
+			}
 #endif
 			
 			sint32_t rs1b = RegVal[I_rs1(inst)];
@@ -1500,7 +1620,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 			// Instruction: SLTIU
 			
 #ifdef DEBUG
-			dprintf(STDERR, "\tSLTIU x%d, x%d, 0x%08X\n", I_rd(inst), I_rs1(inst), I_imm(inst));
+			if (debug) {
+				dprintf(STDERR, "\tSLTIU x%d, x%d, 0x%08X\n\r", I_rd(inst), I_rs1(inst), I_imm(inst));
+			}
 #endif
 			
 			uint32_t rs1b = RegVal[I_rs1(inst)];
@@ -1515,8 +1637,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 			// Instruction: XORI
 			
 #ifdef DEBUG
-			dprintf(STDERR, "\tXORI x%d, x%d, 0x%08X\n", I_rd(inst), I_rs1(inst),
-							I_imm(inst));
+			if (debug) {
+				dprintf(STDERR, "\tXORI x%d, x%d, 0x%08X\n\r", I_rd(inst), I_rs1(inst), I_imm(inst));
+			}
 #endif
 			
 			uint32_t rs1b = RegVal[I_rs1(inst)];
@@ -1526,8 +1649,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 		} else if (I_funct3(inst) == 0x6) {
 			// Instruction: ORI
 #ifdef DEBUG
-			dprintf(STDERR, "\tORI x%d, x%d, 0x%08X\n", I_rd(inst), I_rs1(inst),
-							I_imm(inst));
+			if (debug) {
+				dprintf(STDERR, "\tORI x%d, x%d, 0x%08X\n\r", I_rd(inst), I_rs1(inst), I_imm(inst));
+			}
 #endif
 			
 			uint32_t rs1b = RegVal[I_rs1(inst)];
@@ -1537,8 +1661,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 		} else if (I_funct3(inst) == 0x7) {
 			// Instruction: ANDI
 #ifdef DEBUG
-			dprintf(STDERR, "\tANDI x%d, x%d, 0x%08X\n", I_rd(inst), I_rs1(inst),
-							I_imm(inst));
+			if (debug) {
+				dprintf(STDERR, "\tANDI x%d, x%d, 0x%08X\n\r", I_rd(inst), I_rs1(inst), I_imm(inst));
+			}
 #endif
 			
 			uint32_t rs1b = RegVal[I_rs1(inst)];
@@ -1552,7 +1677,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: SLLI
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tSLLI x%d, x%d, 0x%08X\n", I_rd(inst), I_rs1(inst), I_imm(inst));
+				if (debug) {
+					dprintf(STDERR, "\tSLLI x%d, x%d, 0x%08X\n\r", I_rd(inst), I_rs1(inst), I_imm(inst));
+				}
 #endif
 				
 				uint32_t rs1b = RegVal[I_rs1(inst)];
@@ -1574,7 +1701,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: SRLI
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tSRLI x%d, x%d, 0x%08X\n", I_rd(inst), I_rs1(inst), I_imm(inst));
+				if (debug) {
+					dprintf(STDERR, "\tSRLI x%d, x%d, 0x%08X\n\r", I_rd(inst), I_rs1(inst), I_imm(inst));
+				}
 #endif
 				
 				uint32_t rs1b = RegVal[I_rs1(inst)];
@@ -1585,7 +1714,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: SRAI
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tSRAI x%d, x%d, 0x%08X\n", I_rd(inst), I_rs1(inst), I_imm(inst));
+				if (debug) {
+					dprintf(STDERR, "\tSRAI x%d, x%d, 0x%08X\n\r", I_rd(inst), I_rs1(inst), I_imm(inst));
+				}
 #endif
 				
 				sint32_t rs1b = RegVal[I_rs1(inst)];
@@ -1617,8 +1748,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: ADD
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tADD x%d, x%d, x%d\n", R_rd(inst), R_rs1(inst),
-								R_rs2(inst));
+				if (debug) {
+					dprintf(STDERR, "\tADD x%d, x%d, x%d\n\r", R_rd(inst), R_rs1(inst), R_rs2(inst));
+				}
 #endif
 				
 				uint32_t rs1b = RegVal[R_rs1(inst)];
@@ -1629,8 +1761,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: SUB
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tSUB x%d, x%d, x%d\n", R_rd(inst), R_rs1(inst),
-								R_rs2(inst));
+				if (debug) {
+					dprintf(STDERR, "\tSUB x%d, x%d, x%d\n\r", R_rd(inst), R_rs1(inst), R_rs2(inst));
+				}
 #endif
 				
 				uint32_t rs1b = RegVal[R_rs1(inst)];
@@ -1652,7 +1785,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: SLL
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tSLL x%d, x%d, x%d\n", R_rd(inst), R_rs1(inst), R_rs2(inst));
+				if (debug) {
+					dprintf(STDERR, "\tSLL x%d, x%d, x%d\n\r", R_rd(inst), R_rs1(inst), R_rs2(inst));
+				}
 #endif
 				
 				uint32_t rs1b = RegVal[R_rs1(inst)];
@@ -1674,7 +1809,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: SLT
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tSLT x%d, x%d, x%d\n", R_rd(inst), R_rs1(inst), R_rs2(inst));
+				if (debug) {
+					dprintf(STDERR, "\tSLT x%d, x%d, x%d\n\r", R_rd(inst), R_rs1(inst), R_rs2(inst));
+				}
 #endif
 				
 				sint32_t rs1b = RegVal[R_rs1(inst)];
@@ -1700,7 +1837,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: SLTU
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tSLTU x%d, x%d, x%d\n", R_rd(inst), R_rs1(inst), R_rs2(inst));
+				if (debug) {
+					dprintf(STDERR, "\tSLTU x%d, x%d, x%d\n\r", R_rd(inst), R_rs1(inst), R_rs2(inst));
+				}
 #endif
 				
 				uint32_t rs1b = RegVal[R_rs1(inst)];
@@ -1726,7 +1865,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: XOR
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tXOR x%d, x%d, x%d\n", R_rd(inst), R_rs1(inst), R_rs2(inst));
+				if (debug) {
+					dprintf(STDERR, "\tXOR x%d, x%d, x%d\n\r", R_rd(inst), R_rs1(inst), R_rs2(inst));
+				}
 #endif
 				
 				uint32_t rs1b = RegVal[R_rs1(inst)];
@@ -1748,7 +1889,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: SRL
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tSRL x%d, x%d, x%d\n", R_rd(inst), R_rs1(inst), R_rs2(inst));
+				if (debug) {
+					dprintf(STDERR, "\tSRL x%d, x%d, x%d\n\r", R_rd(inst), R_rs1(inst), R_rs2(inst));
+				}
 #endif
 				
 				uint32_t rs1b = RegVal[R_rs1(inst)];
@@ -1759,7 +1902,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: SRA
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tSRA x%d, x%d, x%d\n", R_rd(inst), R_rs1(inst), R_rs2(inst));
+				if (debug) {
+					dprintf(STDERR, "\tSRA x%d, x%d, x%d\n\r", R_rd(inst), R_rs1(inst), R_rs2(inst));
+				}
 #endif
 				
 				sint32_t rs1b = RegVal[R_rs1(inst)];
@@ -1781,7 +1926,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: OR
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tOR x%d, x%d, x%d\n", R_rd(inst), R_rs1(inst), R_rs2(inst));
+				if (debug) {
+					dprintf(STDERR, "\tOR x%d, x%d, x%d\n\r", R_rd(inst), R_rs1(inst), R_rs2(inst));
+				}
 #endif
 				
 				uint32_t rs1b = RegVal[R_rs1(inst)];
@@ -1803,7 +1950,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: AND
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tAND x%d, x%d, x%d\n", R_rd(inst), R_rs1(inst), R_rs2(inst));
+				if (debug) {
+					dprintf(STDERR, "\tAND x%d, x%d, x%d\n\r", R_rd(inst), R_rs1(inst), R_rs2(inst));
+				}
 #endif
 				
 				uint32_t rs1b = RegVal[R_rs1(inst)];
@@ -1831,7 +1980,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 			// Instruction: FENCE
 			
 #ifdef DEBUG
-			dprintf(STDERR, "\tFENCE\n");
+			if (debug) {
+				dprintf(STDERR, "\tFENCE\n\r");
+			}
 #endif
 			
 			// Do nothing, implemented as a NO-OP
@@ -1840,7 +1991,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 			// Instruction: FENCE.I
 			
 #ifdef DEBUG
-			dprintf(STDERR, "\tFENCE.I\n");
+			if (debug) {
+				dprintf(STDERR, "\tFENCE.I\n\r");
+			}
 #endif
 			
 			// Do nothing, implemented as a NO-OP
@@ -1874,11 +2027,14 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 					return rtn;
 				}
 				
-#ifdef DEBUG
-				dprintf(STDERR, "\tLR.W\n");
-#endif
-				
 				uint32_t addr = RegVal[R_rs1(inst)];
+				
+#ifdef DEBUG
+				uint32_t addr2 = addr;
+				if (debug) {
+					dprintf(STDERR, "\tLR.W\n\r");
+				}
+#endif
 				
 				if (addr & 0x3) {
 					struct retvals rtn;
@@ -1903,6 +2059,14 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				uint32_t rd;
 				rd = ReadPhysMemory(addr, 32, context);
 				
+#ifdef DEBUG
+				if (debug_memaccess) {
+					if ((addr2 & -3) == debugP_addr) {
+						dprintf(STDERR, "[Memory Access] PC: 0x%08X, Load Virt Addr: 0x%08X, Phys Addr: 0x%08X, Value: 0x%08X\n\r", context->pc, addr2, addr, rd);
+					}
+				}
+#endif
+				
 				if (R_rd(inst) != 0) {
 					RegVal[R_rd(inst)] = rd;
 				}
@@ -1910,12 +2074,15 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 			} else if (funct7_prefix == 0x0C) {
 				// Instruction: SC.W
 				
-#ifdef DEBUG
-				dprintf(STDERR, "\tSC.W\n");
-#endif
-				
 				uint32_t addr = RegVal[R_rs1(inst)];
 				uint32_t rs2b = RegVal[R_rs2(inst)];
+				
+#ifdef DEBUG
+				uint32_t addr2 = addr;
+				if (debug) {
+					dprintf(STDERR, "\tSC.W\n\r");
+				}
+#endif
 				
 				if (addr & 0x3) {
 					struct retvals rtn;
@@ -1926,7 +2093,7 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				
 				if (context->mode < 3) {
 					struct retvals rtn;
-					rtn = WalkPTs(addr, context->csr[CSR_SATP], 0, context);
+					rtn = WalkPTs(addr, context->csr[CSR_SATP], 1, context);
 					if (rtn.error) {
 						struct retvals rtn;
 						rtn.value = addr;
@@ -1945,6 +2112,14 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				}
 				context->lr_reserve_set = (sint32_t)-1;
 				
+#ifdef DEBUG
+				if (debug_memaccess) {
+					if ((addr2 & -3) == debugP_addr) {
+						dprintf(STDERR, "[Memory Access] PC: 0x%08X, Save Virt Addr: 0x%08X, Phys Addr: 0x%08X, Value: 0x%08X, Rd: %d\n\r", context->pc, addr2, addr, rs2b, rd);
+					}
+				}
+#endif
+				
 				if (R_rd(inst) != 0) {
 					RegVal[R_rd(inst)] = rd;
 				}
@@ -1953,7 +2128,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: AMOSWAP.W
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tAMOSWAP.W\n");
+				if (debug) {
+					dprintf(STDERR, "\tAMOSWAP.W\n\r");
+				}
 #endif
 				
 				uint32_t addr = RegVal[R_rs1(inst)];
@@ -2002,7 +2179,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: AMOADD.W
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tAMOADD.W\n");
+				if (debug) {
+					dprintf(STDERR, "\tAMOADD.W\n\r");
+				}
 #endif
 				
 				uint32_t addr = RegVal[R_rs1(inst)];
@@ -2051,7 +2230,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: AMOXOR.W
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tAMOXOR.W\n");
+				if (debug) {
+					dprintf(STDERR, "\tAMOXOR.W\n\r");
+				}
 #endif
 				
 				uint32_t addr = RegVal[R_rs1(inst)];
@@ -2100,7 +2281,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: AMOAND.W
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tAMOAND.W\n");
+				if (debug) {
+					dprintf(STDERR, "\tAMOAND.W\n\r");
+				}
 #endif
 				
 				uint32_t addr = RegVal[R_rs1(inst)];
@@ -2149,7 +2332,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: AMOOR.W
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tAMOOR.W\n");
+				if (debug) {
+					dprintf(STDERR, "\tAMOOR.W\n\r");
+				}
 #endif
 				
 				uint32_t addr = RegVal[R_rs1(inst)];
@@ -2198,7 +2383,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: AMOMIN.W
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tAMOMIN.W\n");
+				if (debug) {
+					dprintf(STDERR, "\tAMOMIN.W\n\r");
+				}
 #endif
 				
 				uint32_t addr = RegVal[R_rs1(inst)];
@@ -2253,7 +2440,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: AMOMAX.W
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tAMOMAX.W\n");
+				if (debug) {
+					dprintf(STDERR, "\tAMOMAX.W\n\r");
+				}
 #endif
 				
 				uint32_t addr = RegVal[R_rs1(inst)];
@@ -2308,7 +2497,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: AMOMINU.W
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tAMOMINU.W\n");
+				if (debug) {
+					dprintf(STDERR, "\tAMOMINU.W\n\r");
+				}
 #endif
 				
 				uint32_t addr = RegVal[R_rs1(inst)];
@@ -2363,7 +2554,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: AMOMAXU.W
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tAMOMAXU.W\n");
+				if (debug) {
+					dprintf(STDERR, "\tAMOMAXU.W\n\r");
+				}
 #endif
 				
 				uint32_t addr = RegVal[R_rs1(inst)];
@@ -2464,7 +2657,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				}
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tECALL\n");
+				if (debug) {
+					dprintf(STDERR, "\tECALL\n\r");
+				}
 #endif
 				
 				if        (context->mode == 0) {
@@ -2499,7 +2694,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				}
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tEBREAK\n");
+				if (debug) {
+					dprintf(STDERR, "\tEBREAK\n\r");
+				}
 #endif
 				
 				/* TODO
@@ -2520,8 +2717,10 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 					return rtn;
 				}
 				
-#if defined(DEBUG) || defined(DEBUG_TrapReturn)
-				dprintf(STDERR, "\tSRET to: 0x%08X\n", context->csr[CSR_SEPC]);
+#ifdef DEBUG
+				if (debug || debug_trapret) {
+					dprintf(STDERR, "\tSRET to: 0x%08X\n\r", context->csr[CSR_SEPC]);
+				}
 #endif
 				
 				uint32_t bits_pp  = (context->csr[CSR_MSTATUS] >> 8) & 0x1;
@@ -2559,8 +2758,10 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 					return rtn;
 				}
 				
-#if defined(DEBUG) || defined(DEBUG_TrapReturn)
-				dprintf(STDERR, "\tMRET to: 0x%08X with mode: %d\n", context->csr[CSR_MEPC], bits_pp);
+#ifdef DEBUG
+				if (debug || debug_trapret) {
+					dprintf(STDERR, "\tMRET to: 0x%08X with mode: %d\n\r", context->csr[CSR_MEPC], bits_pp);
+				}
 #endif
 				
 				context->csr[CSR_MSTATUS] &= 0xFFFFE777;
@@ -2587,7 +2788,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				}
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tWFI\n");
+				if (debug) {
+					dprintf(STDERR, "\tWFI\n\r");
+				}
 #endif
 				
 				context->pc += 4;
@@ -2600,7 +2803,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: SFENCE.VMA
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tSFENCE.VMA\n");
+				if (debug) {
+					dprintf(STDERR, "\tSFENCE.VMA\n\r");
+				}
 #endif
 				
 				// Do nothing, implemented as a NO-OP
@@ -2616,7 +2821,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: CSRRW
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tCSRRW x%d, 0x%03X, x%d\n", I_rd(inst), I_imm(inst), I_rs1(inst));
+				if (debug) {
+					dprintf(STDERR, "\tCSRRW x%d, 0x%03X, x%d\n\r", I_rd(inst), I_imm(inst), I_rs1(inst));
+				}
 #endif
 				
 				uint32_t rs1b = RegVal[I_rs1(inst)];
@@ -2637,7 +2844,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: CSRRS
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tCSRRS x%d, 0x%03X, x%d\n", I_rd(inst), I_imm(inst), I_rs1(inst));
+				if (debug) {
+					dprintf(STDERR, "\tCSRRS x%d, 0x%03X, x%d\n\r", I_rd(inst), I_imm(inst), I_rs1(inst));
+				}
 #endif
 				
 				uint32_t rs1b = RegVal[I_rs1(inst)];
@@ -2666,7 +2875,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: CSRRC
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tCSRRC x%d, 0x%03X, x%d\n", I_rd(inst), I_imm(inst), I_rs1(inst));
+				if (debug) {
+					dprintf(STDERR, "\tCSRRC x%d, 0x%03X, x%d\n\r", I_rd(inst), I_imm(inst), I_rs1(inst));
+				}
 #endif
 				
 				uint32_t rs1b = RegVal[I_rs1(inst)];
@@ -2695,7 +2906,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: CSRRWI
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tCSRRWI x%d, 0x%03X, 0x%X\n", I_rd(inst), I_imm(inst), I_rs1(inst));
+				if (debug) {
+					dprintf(STDERR, "\tCSRRWI x%d, 0x%03X, 0x%X\n\r", I_rd(inst), I_imm(inst), I_rs1(inst));
+				}
 #endif
 				
 				uint32_t rs1b = I_rs1(inst);
@@ -2716,7 +2929,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: CSRRSI
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tCSRRSI x%d, 0x%03X, 0x%X\n", I_rd(inst), I_imm(inst), I_rs1(inst));
+				if (debug) {
+					dprintf(STDERR, "\tCSRRSI x%d, 0x%03X, 0x%X\n\r", I_rd(inst), I_imm(inst), I_rs1(inst));
+				}
 #endif
 				
 				uint32_t rs1b = I_rs1(inst);
@@ -2745,7 +2960,9 @@ static inline struct retvals ExecuteInstruction(uint32_t inst, struct cpu_contex
 				// Instruction: CSRRCI
 				
 #ifdef DEBUG
-				dprintf(STDERR, "\tCSRRCI x%d, 0x%03X, 0x%X\n", I_rd(inst), I_imm(inst), I_rs1(inst));
+				if (debug) {
+					dprintf(STDERR, "\tCSRRCI x%d, 0x%03X, 0x%X\n\r", I_rd(inst), I_imm(inst), I_rs1(inst));
+				}
 #endif
 				
 				uint32_t rs1b = I_rs1(inst);
@@ -2815,13 +3032,21 @@ static inline void UpdateTimer(struct cpu_context* context) {
 	cmp_time_us <<= 32;
 	cmp_time_us  |= clint_mtimecmp;
 	
-	if (cmp_time_us <= up_time_us) { // TODO: Double-Check if '<=' or '<' in RISC-V specs
-		// Set timer interrupt
-		context->csr[CSR_MIP] |=  ((uint32_t)0x080);
+#ifdef DEBUG
+	if (debug_timeint) {
+#endif
+		if (cmp_time_us <= up_time_us) { // TODO: Double-Check if '<=' or '<' in RISC-V specs
+			// Set timer interrupt
+			context->csr[CSR_MIP] |=  ((uint32_t)0x080);
+		} else {
+			// Clear timer interrupt
+			context->csr[CSR_MIP] &= ~((uint32_t)0x080);
+		}
+#ifdef DEBUG
 	} else {
-		// Clear timer interrupt
 		context->csr[CSR_MIP] &= ~((uint32_t)0x080);
 	}
+#endif
 	
 	return;
 }
@@ -2923,8 +3148,10 @@ static inline void UpdatePLIC(struct cpu_context* context) {
 
 static inline void TakeTrap(uint32_t exec_mode, uint32_t cause, uint32_t is_interrupt, uint32_t xtval, struct cpu_context* context) {
 	
-#ifdef DEBUG_Trap
-	dprintf(STDERR, "[Trap] pc: 0x%X\n", context->pc);
+#ifdef DEBUG
+	if (debug_trap) {
+		dprintf(STDERR, "[Trap] PC: 0x%X, Into Mode: %d, From Mode: %d, Cause: %d, Is Int.: %d\n\r", context->pc, exec_mode, context->mode, cause, is_interrupt);
+	}
 #endif
 	
 	uint32_t xtvec;
@@ -2968,27 +3195,8 @@ static inline void TakeTrap(uint32_t exec_mode, uint32_t cause, uint32_t is_inte
 }
 
 int RunLoop(struct cpu_context* context) {
-	/*
-	struct pollfd pfd;
-	pfd.fd = STDIN;
-	pfd.events = POLLIN;
-	*/
-	
 	unsigned int i = 0;
 	while (running) {
-		/*
-		signed int retval = poll(&pfd, 1, 0);
-		if (retval > 0 && pfd.revents & POLLIN) {
-			unsigned char buf;
-			retval = read(STDIN, &buf, 1);
-			if (retval > 0) {
-				if (buf == 'd') {
-					return 0;
-				}
-			}
-		}
-		*/
-		
 		// Check for interrupts
 		// Update external interrupts
 		UpdatePLIC(context);
@@ -3107,13 +3315,10 @@ int RunLoop(struct cpu_context* context) {
 		if (rtn.error != CUSTOM_INTERNAL_EXECUTION_SUCCESS) {
 			if (rtn.error == CUSTOM_INTERNAL_WFI_SLEEP) {
 				// WFI
-#ifdef WASM_BUILD
 				return 1;
-#else
-				continue; // TODO: WFI for native
-#endif
+			} else {
+				TakeTrap(3, rtn.error, 0, rtn.value, context);
 			}
-			TakeTrap(3, rtn.error, 0, rtn.value, context);
 		}
 		
 	}
@@ -3122,28 +3327,112 @@ int RunLoop(struct cpu_context* context) {
 }
 
 void* RunEmu(void* ptr) {
-	running = 1;
-	RunLoop(&cpu_cntxt);
+#ifndef WASM_BUILD
+	sigset_t extn_int_sig;
+	sigemptyset(&extn_int_sig);
+	sigaddset(&extn_int_sig, EXTERN_INT_SIG);
+	pthread_sigmask(SIG_UNBLOCK, &extn_int_sig, 0);
+#endif
+	
+	restart_loop:
+	thread_lock(&spinlk);
+	if (running == 2) {
+		running = 1;
+	} else {
+		running = 0;
+	}
+	thread_unlock(&spinlk);
+	uint32_t retval = 0;
+	if (RunLoop(&cpu_cntxt)) {
+		thread_lock(&spinlk);
+		UpdatePLIC(&cpu_cntxt);
+		UpdatePLIC(&cpu_cntxt); // Update twice because of UART implementation
+		UpdateTimer(&cpu_cntxt);
+		if (cpu_cntxt.csr[CSR_MIP] & cpu_cntxt.csr[CSR_MIE]) {
+			retval = 0x10000;
+		}
+		retval |= cpu_cntxt.csr[CSR_MIE];
+		
+#ifndef WASM_BUILD
+		if (retval & 0x10000 && running != 0) {
+			running = 2;
+			thread_unlock(&spinlk);
+			goto restart_loop;
+		}
+#ifdef DEBUG
+		if (retval & 0x080 && debug_timeint) {
+#else
+		if (retval & 0x080) {
+#endif
+			uint64_t up_time_us;
+			up_time_us    = clint_timeh;
+			up_time_us  <<= 32;
+			up_time_us   |= clint_time;
+			
+			uint64_t cmp_time_us;
+			cmp_time_us   = clint_mtimecmph;
+			cmp_time_us <<= 32;
+			cmp_time_us  |= clint_mtimecmp;
+			
+			cmp_time_us -= up_time_us; // Time until next timer interrupt
+			cmp_time_us *= 1000; // Convert to nanoseconds
+			
+			uint64_t sec;
+			uint64_t nsec;
+			
+			sec  = cmp_time_us / 1000000000;
+			nsec = cmp_time_us % 1000000000;
+			
+			struct timespec slp_tm;
+			slp_tm.tv_sec = sec;
+			slp_tm.tv_nsec = nsec;
+			
+			if (running != 0) {
+				running = 4;
+			}
+			thread_unlock(&spinlk);
+			nanosleep(&slp_tm, 0);
+			thread_lock(&spinlk);
+			if (running == 4) {
+				running = 2;
+			}
+			thread_unlock(&spinlk);
+			goto restart_loop;
+		}
+#endif
+		
+		running = 0;
+		thread_unlock(&spinlk);
+	}
 	thread_lock(&spinlk);
 	running = 0;
-	UpdatePLIC(&cpu_cntxt);
-	UpdateTimer(&cpu_cntxt);
-	uint32_t retval = 0; 
-	if (cpu_cntxt.csr[CSR_MIP] & cpu_cntxt.csr[CSR_MIE]) {
-		retval = 0x10000;
-	}
-	retval |= cpu_cntxt.csr[CSR_MIE];
 	thread_unlock(&spinlk);
 	return (void*)((unsigned long)retval);
 }
 
 #ifndef WASM_BUILD
+void return_signal_received() {
+	return;
+}
+
+static void StartEmu(pthread_t* thread) {
+	thread_lock(&spinlk);
+	if        (running == 0) {
+		running = 2;
+		pthread_create(thread, NULL, RunEmu, NULL);
+	} else if (running == 4) {
+		kill(0, EXTERN_INT_SIG);
+	}
+	thread_unlock(&spinlk);
+	return;
+}
+
 signed int main(unsigned int argc, char *argv[], char *envp[]) {
 	if (argc <= 2) {
 		return 1;
 	}
 	
-	unsigned int fd;
+	signed int fd;
 	fd = open(argv[1], O_RDONLY);
 	if (fd == -1) {
 		return 2;
@@ -3195,21 +3484,31 @@ signed int main(unsigned int argc, char *argv[], char *envp[]) {
 		return 11;
 	}
 	
+	sigset_t extn_int_sig;
+	sigemptyset(&extn_int_sig);
+	sigaddset(&extn_int_sig, EXTERN_INT_SIG);
+	sigprocmask(SIG_BLOCK, &extn_int_sig, 0);
+	
+	struct sigaction sact;
+	sact.sa_handler = return_signal_received;
+	sigemptyset(&sact.sa_mask);
+	sact.sa_flags = 0;
+	sigaction(EXTERN_INT_SIG, &sact, 0);
+	
 	// START: Setup the Terminal
-  // Set TTY to Raw mode
-  struct termios old_tty_settings;
-  {
-    struct termios raw_tty_settings;
-    signed int retval;
-    retval = ioctl(STDIN, TCGETS, &old_tty_settings);
-    memcpy(&raw_tty_settings, &old_tty_settings, sizeof(struct termios));
-    raw_tty_settings.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
-    raw_tty_settings.c_oflag &= ~OPOST;
-    raw_tty_settings.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
-    raw_tty_settings.c_cflag &= ~(CSIZE | PARENB);
-    raw_tty_settings.c_cflag |= CS8;
-    retval = ioctl(STDIN, TCSETS, &raw_tty_settings);
-  }
+	// Set TTY to Raw mode
+	struct termios old_tty_settings;
+	{
+		struct termios raw_tty_settings;
+		ioctl(STDIN, TCGETS, &old_tty_settings);
+		memcpy(&raw_tty_settings, &old_tty_settings, sizeof(struct termios));
+		raw_tty_settings.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
+		raw_tty_settings.c_oflag &= ~OPOST;
+		raw_tty_settings.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+		raw_tty_settings.c_cflag &= ~(CSIZE | PARENB);
+		raw_tty_settings.c_cflag |= CS8;
+		ioctl(STDIN, TCSETS, &raw_tty_settings);
+	}
 	
 	InitEmu(memory_size, mmdata_size);
 	
@@ -3219,7 +3518,7 @@ signed int main(unsigned int argc, char *argv[], char *envp[]) {
 	free(mmdata_buf);
 	
 	pthread_t thread;
-	pthread_create(&thread, NULL, RunEmu, NULL);
+	StartEmu(&thread);
 	
 	int loop = 1;
 	struct pollfd pfd;
@@ -3238,29 +3537,54 @@ signed int main(unsigned int argc, char *argv[], char *envp[]) {
 				if (ret_val == EINTR) {
 					continue;
 				}
-				dprintf(STDERR, "Read Error\n\r");
+				dprintf(STDOUT, "Read Error\n\r");
 				loop = 0;
 				running = 0;
 				break;
 			}
-			if (val == '~') {
+			if        (val == ('q' + 1 - 'a')) {
 				loop = 0;
+				thread_lock(&spinlk);
+				if (running == 4) {
+					kill(0, EXTERN_INT_SIG);
+				}
 				running = 0;
+				thread_unlock(&spinlk);
+#ifdef DEBUG
+			} else if (val == ('d' + 1 - 'a')) {
+				debug = !debug;
+			} else if (val == ('f' + 1 - 'a')) {
+				debug_trap = !debug_trap;
+			} else if (val == ('g' + 1 - 'a')) {
+				debug_trapret = !debug_trapret;
+			} else if (val == ('h' + 1 - 'a')) {
+				debug_pagead = !debug_pagead;
+			} else if (val == ('j' + 1 - 'a')) {
+				debug_memaccess = !debug_memaccess;
+			} else if (val == ('t' + 1 - 'a')) {
+				debug_timeint = !debug_timeint;
+				StartEmu(&thread);
+#endif
+			} else {
+				thread_lock(&spinlk);
+				if (uart0_rxcuecount < UART_RX_FIFO_SIZE) {
+					uart0_rxcue[uart0_rxcuestoreindex] = val;
+					uart0_rxcuestoreindex = (uart0_rxcuestoreindex + 1) % UART_RX_FIFO_SIZE;
+					uart0_rxcuecount++;
+				}
+				thread_unlock(&spinlk);
+				StartEmu(&thread);
 			}
-			thread_lock(&spinlk);
-			if (uart0_rxcuecount < UART_RX_FIFO_SIZE) {
-				uart0_rxcue[uart0_rxcuestoreindex] = val;
-				uart0_rxcuestoreindex = (uart0_rxcuestoreindex + 1) % UART_RX_FIFO_SIZE;
-				uart0_rxcuecount++;
-			}
-			thread_unlock(&spinlk);
 		}
 	} while (loop);
 	pthread_join(thread, NULL);
 	
 	ioctl(STDIN, TCSETS, &old_tty_settings);
+	dprintf(STDOUT, "\e[?25h");
 	
 	DestroyEmu();
+	
+	sigprocmask(SIG_UNBLOCK, &extn_int_sig, 0);
 	
 	return 0;
 }
