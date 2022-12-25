@@ -28,6 +28,7 @@ clang \
 	-nostdlib \
 	-std=c99 \
 	$EXPORT \
+	-fuse-ld=lld \
 	-Wl,--lto-O3 \
 	-Wl,--no-entry \
 	-Wl,--strip-all \
