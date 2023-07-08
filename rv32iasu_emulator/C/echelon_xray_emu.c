@@ -3137,10 +3137,10 @@ static inline void UpdatePLIC(struct cpu_context* context) {
 	plic_h0_s_claim_compl = 0;
 	if (plic_pending_array & (1 << PLIC_SOURCENUM_UART)) {
 		if (plic_h0_m_inter_en & (1 << PLIC_SOURCENUM_UART)) {
-			plic_h0_m_claim_compl = PLIC_SOURCENUM_UART;
+			plic_h0_m_claim_compl |= PLIC_SOURCENUM_UART;
 		}
 		if (plic_h0_s_inter_en & (1 << PLIC_SOURCENUM_UART)) {
-			plic_h0_s_claim_compl = PLIC_SOURCENUM_UART;
+			plic_h0_s_claim_compl |= PLIC_SOURCENUM_UART;
 		}
 	}
 	return;
