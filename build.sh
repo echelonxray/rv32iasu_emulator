@@ -37,7 +37,7 @@ clang \
 	-Wl,--max-memory=268435456 \
 	-Wl,--initial-memory=268435456 \
 	-Wl,--allow-undefined \
-	-Wl,-z,stack-size=$[16 * 1024 * 1024] \
+	-Wl,-z,stack-size=$((16 * 1024 * 1024)) \
 	echelon_xray_emu.c -o echelon_xray_emu.wasm
 
 gcc -march=native -O3 ./echelon_xray_emu.c -o ./echelon_xray_emu.out -UWASM_BUILD -lpthread
