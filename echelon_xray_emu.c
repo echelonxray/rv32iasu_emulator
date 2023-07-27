@@ -3528,16 +3528,17 @@ signed int main(unsigned int argc, char *argv[], char *envp[]) {
 	do {
 		do {
 			ret_val = poll(&pfd, 1, 5000);
-		} while (ret_val < 0);
-		
+		} while (ret_val <= 0);
+
 		if (pfd.revents & POLLIN) {
 			char val;
 			ret_val = read(STDIN, &val, 1);
+			//dprintf(STDOUT, "TRACE");
 			if (ret_val <= 0) {
 				if (ret_val == EINTR) {
 					continue;
 				}
-				dprintf(STDOUT, "Read Error\n\r");
+				dprintf(STDOUT, "Read Error: %d: %s\n\r", errno, strerror(errno));
 				loop = 0;
 				running = 0;
 				break;
