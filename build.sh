@@ -40,7 +40,7 @@ clang \
 	-Wl,-z,stack-size=$[16 * 1024 * 1024] \
 	echelon_xray_emu.c -o echelon_xray_emu.wasm
 
-gcc -lpthread -march=native -O3 ./echelon_xray_emu.c -o ./echelon_xray_emu.out
-strip ./echelon_xray_emu.out
+gcc -g -lpthread -march=native -O3 ./echelon_xray_emu.c -o ./echelon_xray_emu.out
+strip ./echelon_xray_emu.out -o ./echelon_xray_emu.out.strip
 
 exit 0
