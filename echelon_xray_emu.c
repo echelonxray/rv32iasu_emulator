@@ -3533,12 +3533,11 @@ signed int main(unsigned int argc, char *argv[], char *envp[]) {
 		if (pfd.revents & POLLIN) {
 			char val;
 			ret_val = read(STDIN, &val, 1);
-			//dprintf(STDOUT, "TRACE");
 			if (ret_val <= 0) {
 				if (ret_val == EINTR) {
 					continue;
 				}
-				dprintf(STDOUT, "Read Error: %d: %s\n\r", errno, strerror(errno));
+				dprintf(STDOUT, "Read Error\n\r");
 				loop = 0;
 				running = 0;
 				break;
