@@ -3421,7 +3421,7 @@ static void StartEmu(pthread_t* thread) {
 		running = 2;
 		pthread_create(thread, NULL, RunEmu, NULL);
 	} else if (running == 4) {
-		kill(0, EXTERN_INT_SIG);
+		pthread_kill(*thread, EXTERN_INT_SIG);
 	}
 	thread_unlock(&spinlk);
 	return;
@@ -3546,7 +3546,7 @@ signed int main(unsigned int argc, char *argv[], char *envp[]) {
 				loop = 0;
 				thread_lock(&spinlk);
 				if (running == 4) {
-					kill(0, EXTERN_INT_SIG);
+					pthread_kill(thread, EXTERN_INT_SIG);
 				}
 				running = 0;
 				thread_unlock(&spinlk);
