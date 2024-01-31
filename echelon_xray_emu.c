@@ -358,37 +358,13 @@ static void print_reg_state(struct cpu_context *context, uint32_t data) {
 static void DestroyEmu() {
 	free(memory);
 	free(mmdata);
+
 	return;
 }
 #endif
 
 void _InitEmu() {
-#ifdef WASM_BUILD
-	currently_allocated = 0;
-	spinlk = 0;
-#else
-	sem_init(&spinlk, 0, 1);
-#endif
-	
-#ifdef DEBUG
-	debug = 0;
-	debug_trap = 0;
-	debug_trapret = 0;
-	debug_timeint = 1;
-	debug_pagead = 0;
-	debug_memaccess = 0;
-#endif
-	
-	running = 0;
 	pwrc_state = 0;
-	
-	memory = malloc(0x08000000);
-	if (disk_image_length & 0x3) {
-		disk_image_length +=  4;
-		disk_image_length &= -4;
-	}
-	mmdata = malloc(disk_image_length);
-	mmdata_length = disk_image_length;
 	
 	memset(&cpu_cntxt, 0, sizeof(struct cpu_context));
 	cpu_cntxt.pc = 0x80000000;
@@ -448,6 +424,32 @@ void _InitEmu() {
 void InitEmu(uint32_t firmware_length_l, uint32_t disk_image_length_l) {
 	firmware_length = firmware_length_l;
 	disk_image_length = disk_image_length_l;
+
+#ifdef WASM_BUILD
+	currently_allocated = 0;
+	spinlk = 0;
+#else
+	sem_init(&spinlk, 0, 1);
+#endif
+	
+#ifdef DEBUG
+	debug = 0;
+	debug_trap = 0;
+	debug_trapret = 0;
+	debug_timeint = 1;
+	debug_pagead = 0;
+	debug_memaccess = 0;
+#endif
+	
+	running = 0;
+
+	memory = malloc(0x08000000);
+	if (disk_image_length & 0x3) {
+		disk_image_length +=  4;
+		disk_image_length &= -4;
+	}
+	mmdata = malloc(disk_image_length);
+	mmdata_length = disk_image_length;
 
 	_InitEmu();
 
@@ -3233,6 +3235,9 @@ int RunLoop(struct cpu_context* context) {
 	while (running) {
 		if        (pwrc_state == 1) {
 			// Reset
+#ifndef WASM_BUILD
+			dprintf(STDOUT, "RV32EMU: Reset\n\r");
+#endif
 			_InitEmu();
 		} else if (pwrc_state == 2) {
 			// Shutdown
