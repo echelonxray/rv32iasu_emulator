@@ -221,6 +221,7 @@ sem_t spinlk;
 #endif
 
 // Internal
+uint32_t noreboot;
 uint32_t firmware_length;
 uint32_t disk_image_length;
 
@@ -3238,12 +3239,21 @@ int RunLoop(struct cpu_context* context) {
 #ifndef WASM_BUILD
 			dprintf(STDOUT, "RV32EMU: Reset\n\r");
 #endif
+			if (noreboot) {
+				goto noreboot;
+			}
 			_InitEmu();
 		} else if (pwrc_state == 2) {
 			// Shutdown
 #ifndef WASM_BUILD
+			dprintf(STDOUT, "RV32EMU: Shutdown\n\r");
+#endif
+			noreboot:
+#ifndef WASM_BUILD
 			// Only implement in native build
 			//return CUSTOM_INTERNAL_SHUTDOWN; TODO
+			pwrc_state = 2;
+			pthread_exit(0);
 #else
 			// If WASM, just clear the state
 			pwrc_state = 0;
@@ -3481,6 +3491,13 @@ static void StartEmu(pthread_t* thread) {
 }
 
 signed int main(unsigned int argc, char *argv[], char *envp[]) {
+	noreboot = 0;
+	for (unsigned int i = 3; i < argc; i++) {
+		if (!strcmp(argv[i], "--no-reboot")) {
+			noreboot = 1;
+		}
+	}
+	
 	if (argc <= 2) {
 		return 1;
 	}
@@ -3537,10 +3554,10 @@ signed int main(unsigned int argc, char *argv[], char *envp[]) {
 		return 11;
 	}
 	
-	sigset_t extn_int_sig;
-	sigemptyset(&extn_int_sig);
-	sigaddset(&extn_int_sig, EXTERN_INT_SIG);
-	sigprocmask(SIG_BLOCK, &extn_int_sig, 0);
+	//sigset_t extn_int_sig;
+	//sigemptyset(&extn_int_sig);
+	//sigaddset(&extn_int_sig, EXTERN_INT_SIG);
+	//sigprocmask(SIG_BLOCK, &extn_int_sig, 0);
 	
 	struct sigaction sact;
 	sact.sa_handler = return_signal_received;
@@ -3578,7 +3595,10 @@ signed int main(unsigned int argc, char *argv[], char *envp[]) {
 	pfd.revents = 0;
 	do {
 		do {
-			ret_val = poll(&pfd, 1, 5000);
+			ret_val = poll(&pfd, 1, 500);
+			if (pwrc_state == 2) {
+				goto shutdown_emu;
+			}
 		} while (ret_val <= 0);
 
 		if (pfd.revents & POLLIN) {
@@ -3628,6 +3648,7 @@ signed int main(unsigned int argc, char *argv[], char *envp[]) {
 			}
 		}
 	} while (loop);
+	shutdown_emu:
 	pthread_join(thread, NULL);
 	
 	free(memory_buf);
@@ -3638,7 +3659,7 @@ signed int main(unsigned int argc, char *argv[], char *envp[]) {
 	
 	DestroyEmu();
 	
-	sigprocmask(SIG_UNBLOCK, &extn_int_sig, 0);
+	//sigprocmask(SIG_UNBLOCK, &extn_int_sig, 0);
 	
 	return 0;
 }
