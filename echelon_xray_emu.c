@@ -86,6 +86,8 @@ typedef int64_t sint64_t;
 // 0x8000_0000: RAM
 #define ADDR_RAM_START  0x80000000
 #define ADDR_RAM_LENGTH 0x08000000
+#define ADDR_PWRC_START  0x00100000
+#define ADDR_PWRC_LENGTH 0x00001000
 #define ADDR_PLIC_START  0x0C000000
 #define ADDR_PLIC_LENGTH 0x00210000
 #define ADDR_CLINT_START  0x02000000
@@ -157,6 +159,8 @@ typedef int64_t sint64_t;
 // --
 #define CUSTOM_INTERNAL_WFI_SLEEP         24
 #define CUSTOM_INTERNAL_EXECUTION_SUCCESS 25
+#define CUSTOM_INTERNAL_RESET             26
+#define CUSTOM_INTERNAL_SHUTDOWN          27
 
 // CSRs
 // -- 0xF1? MRO
@@ -216,10 +220,17 @@ volatile uint32_t spinlk;
 sem_t spinlk;
 #endif
 
+// Internal
+uint32_t firmware_length;
+uint32_t disk_image_length;
+
 void* mmdata; // 0x2000_0000
 void* memory; // 0x8000_0000
 
 uint32_t mmdata_length; // Should be in 4 byte increments
+
+// PWRC Regs
+uint32_t pwrc_state;
 
 // PLIC Regs
 uint32_t plic_source_priority; //       Offset 0x0000_0000
@@ -351,7 +362,7 @@ static void DestroyEmu() {
 }
 #endif
 
-void InitEmu(uint32_t firmware_length, uint32_t disk_image_length) {
+void _InitEmu() {
 #ifdef WASM_BUILD
 	currently_allocated = 0;
 	spinlk = 0;
@@ -369,6 +380,7 @@ void InitEmu(uint32_t firmware_length, uint32_t disk_image_length) {
 #endif
 	
 	running = 0;
+	pwrc_state = 0;
 	
 	memory = malloc(0x08000000);
 	if (disk_image_length & 0x3) {
@@ -430,6 +442,15 @@ void InitEmu(uint32_t firmware_length, uint32_t disk_image_length) {
 	uart0_rxcueloadindex = 0;
 	uart0_rxcuecount = 0;
 	
+	return;
+}
+
+void InitEmu(uint32_t firmware_length_l, uint32_t disk_image_length_l) {
+	firmware_length = firmware_length_l;
+	disk_image_length = disk_image_length_l;
+
+	_InitEmu();
+
 	return;
 }
 
@@ -680,6 +701,19 @@ static inline void SavePhysMemory(uint32_t addr, unsigned int bitwidth, struct c
 			} else if (addr == 0x07) {
 				// spr
 				uart0_spr = value & 0xFF;
+			}
+		}
+	} else if (addr >= ADDR_PWRC_START && addr < ADDR_PWRC_START + ADDR_PWRC_LENGTH) {
+		addr -= ADDR_PWRC_START;
+		if (bitwidth == 32) {
+			if (addr == 0x00) {
+				if        (value == 1) {
+					// Reset
+					pwrc_state = 1;
+				} else if (value == 2) {
+					// Shutdown
+					pwrc_state = 2;
+				}
 			}
 		}
 	}
@@ -3197,6 +3231,20 @@ static inline void TakeTrap(uint32_t exec_mode, uint32_t cause, uint32_t is_inte
 int RunLoop(struct cpu_context* context) {
 	unsigned int i = 0;
 	while (running) {
+		if        (pwrc_state == 1) {
+			// Reset
+			_InitEmu();
+		} else if (pwrc_state == 2) {
+			// Shutdown
+#ifndef WASM_BUILD
+			// Only implement in native build
+			//return CUSTOM_INTERNAL_SHUTDOWN; TODO
+#else
+			// If WASM, just clear the state
+			pwrc_state = 0;
+#endif
+		}
+
 		// Check for interrupts
 		// Update external interrupts
 		UpdatePLIC(context);
@@ -3514,8 +3562,6 @@ signed int main(unsigned int argc, char *argv[], char *envp[]) {
 	
 	memcpy(memory, memory_buf, memory_size);
 	memcpy(mmdata, mmdata_buf, mmdata_size);
-	free(memory_buf);
-	free(mmdata_buf);
 	
 	pthread_t thread;
 	StartEmu(&thread);
@@ -3578,6 +3624,9 @@ signed int main(unsigned int argc, char *argv[], char *envp[]) {
 		}
 	} while (loop);
 	pthread_join(thread, NULL);
+	
+	free(memory_buf);
+	free(mmdata_buf);
 	
 	ioctl(STDIN, TCSETS, &old_tty_settings);
 	dprintf(STDOUT, "\e[?25h");
