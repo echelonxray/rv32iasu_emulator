@@ -3608,6 +3608,10 @@ signed int main(unsigned int argc, char *argv[], char *envp[]) {
 				if (ret_val == EINTR) {
 					continue;
 				}
+				if (ret_val == 0) { // Hack for running with no STDIN
+					pfd.events = 0;
+					continue;
+				}
 				dprintf(STDOUT, "Read Error\n\r");
 				loop = 0;
 				running = 0;
