@@ -164,38 +164,39 @@ typedef int64_t sint64_t;
 
 // CSRs
 // -- 0xF1? MRO
-#define CSR_MVENDORID 0 // 0xF11
-#define CSR_MARCHID 1   // 0xF12
-#define CSR_MIMPID 2    // 0xF13
-#define CSR_MHARTID 3   // 0xF14
+#define CSR_MVENDORID 0   // 0xF11
+#define CSR_MARCHID 1     // 0xF12
+#define CSR_MIMPID 2      // 0xF13
+#define CSR_MHARTID 3     // 0xF14
 // -- 0x30? MRW
-#define CSR_MSTATUS 4   // 0x300
-#define CSR_MISA 5      // 0x301
-// Placeholder: MEDELEG // 0x302
-#define CSR_MIDELEG 6   // 0x303
-#define CSR_MIE 7       // 0x304
-#define CSR_MTVEC 8     // 0x305
+#define CSR_MSTATUS 4     // 0x300
+#define CSR_MISA 5        // 0x301
+// Placeholder: MEDELEG   // 0x302
+#define CSR_MIDELEG 6     // 0x303
+#define CSR_MIE 7         // 0x304
+#define CSR_MTVEC 8       // 0x305
 // -- 0x34? MRW
-#define CSR_MSCRATCH 9  // 0x340
-#define CSR_MEPC 10     // 0x341
-#define CSR_MCAUSE 11   // 0x342
-#define CSR_MTVAL 12    // 0x343
-#define CSR_MIP 13      // 0x344
+#define CSR_MSCRATCH 9    // 0x340
+#define CSR_MEPC 10       // 0x341
+#define CSR_MCAUSE 11     // 0x342
+#define CSR_MTVAL 12      // 0x343
+#define CSR_MIP 13        // 0x344
 // -- 0x10? SRW
-// Placeholder: SSTATUS // 0x100
-// Placeholder: SIE     // 0x104
-#define CSR_STVEC 14    // 0x105
+// Placeholder: SSTATUS   // 0x100
+// Placeholder: SIE       // 0x104
+#define CSR_STVEC 14      // 0x105
+#define CSR_SCOUNTEREN 15 // 0x106
 // -- 0x14? SRW
-#define CSR_SSCRATCH 15 // 0x140
-#define CSR_SEPC 16     // 0x141
-#define CSR_SCAUSE 17   // 0x142
-#define CSR_STVAL 18    // 0x143
-// Placeholder: SIP     // 0x144
+#define CSR_SSCRATCH 16   // 0x140
+#define CSR_SEPC 17       // 0x141
+#define CSR_SCAUSE 18     // 0x142
+#define CSR_STVAL 19      // 0x143
+// Placeholder: SIP       // 0x144
 // -- 0x18? SRW
-#define CSR_SATP 19     // 0x180
+#define CSR_SATP 20       // 0x180
 // -- 0xC?? URO
-// Placeholder: TIME    // 0xC01
-// Placeholder: TIMEH   // 0xC81
+// Placeholder: TIME      // 0xC01
+// Placeholder: TIMEH     // 0xC81
 
 #define UART_RX_FIFO_SIZE 16
 
@@ -1130,6 +1131,8 @@ static inline struct retvals CSR_Read(uint32_t csr_addr, struct cpu_context* con
 		rtn.value = context->csr[CSR_MIE] & context->csr[CSR_MIDELEG]; // SIE
 	} else if (csr_addr == 0x105) {
 		rtn.value = context->csr[CSR_STVEC];
+	} else if (csr_addr == 0x106) {
+		rtn.value = 0;
 	} else if (csr_addr == 0x140) {
 		rtn.value = context->csr[CSR_SSCRATCH];
 	} else if (csr_addr == 0x141) {
